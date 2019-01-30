@@ -13,6 +13,7 @@ error-chain = "0.12"
 node-cli = { path = "node/cli" }
 futures = "0.1"
 ctrlc = { version = "3.0", features = ["termination"] }
+openssl = { version = "0.10", features = ["vendored"] }
 
 [build-dependencies]
 vergen = "2"
