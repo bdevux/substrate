@@ -1,4 +1,4 @@
-// Copyright 2018 Parity Technologies (UK) Ltd.
+// Copyright 2018-2019 Parity Technologies (UK) Ltd.
 // This file is part of Substrate.
 
 // Substrate is free software: you can redistribute it and/or modify
@@ -14,8 +14,8 @@
 // You should have received a copy of the GNU General Public License
 // along with Substrate.  If not, see <http://www.gnu.org/licenses/>.
 
-use rand::{OsRng, Rng};
-use substrate_primitives::ed25519::Pair;
+use rand::{rngs::OsRng, RngCore};
+use super::Crypto;
 
 fn good_waypoint(done: u64) -> u64 {
 	match done {
@@ -38,9 +38,9 @@ fn next_seed(mut seed: [u8; 32]) -> [u8; 32] {
 
 /// A structure used to carry both Pair and seed.
 /// This should usually NOT been used. If unsure, use Pair.
-pub struct KeyPair {
-	pub pair: Pair,
-	pub seed: [u8; 32],
+pub(super) struct KeyPair<C: Crypto> {
+	pub pair: C::Pair,
+	pub seed: C::Seed,
 	pub score: usize,
 }
 
@@ -57,10 +57,14 @@ fn calculate_score(_desired: &str, key: &str) -> usize {
 	0
 }
 
-pub fn generate_key(_desired: &str) -> Result<KeyPair, &str> {
-	println!("Generating key containing pattern '{}'", _desired);
+pub(super) fn generate_key<C: Crypto<Seed=[u8; 32]>>(desired: &str) -> Result<KeyPair<C>, &str> {
+	if desired.is_empty() {
+		return Err("Pattern must not be empty");
+	}
 
-	let top = 45 + (_desired.len() * 48);
+	println!("Generating key containing pattern '{}'", desired);
+
+	let top = 45 + (desired.len() * 48);
 	let mut best = 0;
 	let mut seed = [0u8; 32];
 	let mut done = 0;
@@ -73,10 +77,10 @@ pub fn generate_key(_desired: &str) -> Result<KeyPair, &str> {
 			OsRng::new().unwrap().fill_bytes(&mut seed[..]);
 		}
 
-		let p = Pair::from_seed(&seed);
-		let ss58 = p.public().to_ss58check();
-		let score = calculate_score(&_desired, &ss58);
-		if score > best || _desired.len() < 2 {
+		let p = C::pair_from_seed(&seed);
+		let ss58 = C::ss58_from_pair(&p);
+		let score = calculate_score(&desired, &ss58);
+		if score > best || desired.len() < 2 {
 			best = score;
 			let keypair = KeyPair {
 				pair: p,
@@ -100,12 +104,14 @@ pub fn generate_key(_desired: &str) -> Result<KeyPair, &str> {
 #[cfg(test)]
 mod tests {
 	use super::*;
+	use super::super::Ed25519;
+	use substrate_primitives::Pair;
 	#[cfg(feature = "bench")]
 	use test::Bencher;
 
 	#[test]
 	fn test_generation_with_single_char() {
-		assert!(generate_key("j").unwrap().pair.public().to_ss58check().contains("j"));
+		assert!(generate_key::<Ed25519>("j").unwrap().pair.public().to_ss58check().contains("j"));
 	}
 
 	#[test]

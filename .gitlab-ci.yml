@@ -1,23 +1,26 @@
 # .gitlab-ci.yml
-#
+
+
+
 stages:
+  - merge-test
   - test
   - build
   - publish
+  - deploy
 
 image:                             parity/rust:nightly
 
 variables:
   CI_SERVER_NAME:                  "GitLab CI"
   CARGO_HOME:                      "${CI_PROJECT_DIR}/.cargo"
+  # have OS based build containers in the future
+  DOCKER_OS:                       "ubuntu:xenial"
+  ARCH:                            "x86_64"
 
 
 
-cache:
-  key:                             "${CI_JOB_NAME}"
-  paths:
-    - ./.cargo/
-
+cache:                             {}
 
 .collect_artifacts:                &collect_artifacts
   artifacts:
@@ -25,102 +28,292 @@ cache:
     when:                          on_success
     expire_in:                     7 days
     paths:
-    - target/release/
+    - artifacts/
 
 
-# not needed atm
-# .determine_version: &determine_version |
-#   export VERSION="$(sed -r -n '1,/^version/s/^version = "([^"]+)".*$/\1/p' Cargo.toml)";
-#   echo "Version = " $VERSION
 
-before_script:
- - ./scripts/build.sh
+.kubernetes_build:                 &kubernetes_build
+  tags:
+    - kubernetes-parity-build
+  environment:
+    name: parity-build
+
+
+
+#### stage:                        merge-test
+
+check:merge:conflict:
+  stage:                           merge-test
+  image:                           parity/tools:latest
+  cache:                           {}
+  <<:                              *kubernetes_build
+  only:
+    - /^[0-9]+$/
+  variables:
+    GITHUB_API:                    "https://api.github.com"
+    GITLAB_API:                    "https://gitlab.parity.io/api/v4"
+    GITHUB_API_PROJECT:            "parity%2Finfrastructure%2Fgithub-api"
+  script:
+    - ./scripts/gitlab/check_merge_conflict.sh
+
+
 
 
 #### stage:                        test
 
+check:runtime:
+  stage:                           test
+  image:                           parity/tools:latest
+  cache:                           {}
+  <<:                              *kubernetes_build
+  only:
+    - /^[0-9]+$/
+  variables:
+    GITLAB_API:                    "https://gitlab.parity.io/api/v4"
+    GITHUB_API_PROJECT:            "parity%2Finfrastructure%2Fgithub-api"
+  script:
+    - ./scripts/gitlab/check_runtime.sh
+
+
+
 
 test:rust:stable:                  &test
   stage:                           test
+  cache:
+    key:                           "${CI_JOB_NAME}-test"
+    paths:
+      - ${CARGO_HOME}
+      - ./target
   variables:
     RUST_TOOLCHAIN: stable
+    # Enable debug assertions since we are running optimized builds for testing
+    # but still want to have debug assertions.
+    RUSTFLAGS: -Cdebug-assertions=y
     TARGET: native
+  tags:
+    - linux-docker
   only:
-    - triggers
     - tags
     - master
     - schedules
     - web
-    - /^pr-[0-9]+$/
     - /^[0-9]+$/
-
-  tags:
-    - linux-docker
+  before_script:
+   - test -d ${CARGO_HOME} -a -d ./target &&
+     echo "build cache size:" &&
+     du -h --max-depth=2 ${CARGO_HOME} ./target
+   - ./scripts/build.sh
   script:
     - time cargo test --all --release --verbose --locked
 
-.optional_test:                    &optional_test
-  <<:                              *test
-  allow_failure:                   true
+
+
+
+
+.build_only:                      &build_only
   only:
     - master
-
-
+    - tags
+    - web
 
 
 #### stage:                        build
 
 build:rust:linux:release:          &build
   stage:                           build
+  cache:
+    key:                           "${CI_JOB_NAME}-build"
+    paths:
+      - ${CARGO_HOME}
+      - ./target
   <<:                              *collect_artifacts
-  only:
-    - master
-    - tags
-    - web
+  <<:                              *build_only
+  tags:
+    - linux-docker
+  before_script:
+   - ./scripts/build.sh
+  script:
+    - time cargo build --release --verbose
+    - mkdir -p ./artifacts
+    - mv ./target/release/substrate ./artifacts/.
+    - echo -n "Substrate version = "
+    - if [ "${CI_COMMIT_TAG}" ]; then
+        echo "${CI_COMMIT_TAG}" | tee ./artifacts/VERSION;
+      else
+        ./artifacts/substrate --version |
+        sed -n -r 's/^substrate ([0-9.]+.*-[0-9a-f]{7,13})-.*$/\1/p' |
+        tee ./artifacts/VERSION;
+      fi
+    - sha256sum ./artifacts/substrate | tee ./artifacts/substrate.sha256
+    - echo "\n# building node-template\n"
+    - ./scripts/node-template-release.sh ./artifacts/substrate-node-template.tar.gz
+    - cp -r scripts/docker/* ./artifacts
+
+
+
+build:rust:doc:release:            &build
+  stage:                           build
+  allow_failure:                   true
+  artifacts:
+    name:                          "${CI_JOB_NAME}_${CI_COMMIT_REF_NAME}-doc"
+    when:                          on_success
+    expire_in:                     7 days
+    paths:
+    - ./crate-docs
+  <<:                              *build_only
   tags:
     - linux-docker
   script:
-    - time cargo build --release --verbose;
-    - ./target/release/substrate --version
-    - sha256sum ./target/release/substrate
-
+    - rm -f ./crate-docs/index.html # use it as an indicator if the job succeeds
+    - time cargo +nightly doc --release --verbose
+    - cp -R ./target/doc ./crate-docs
+    - echo "<meta http-equiv=refresh content=0;url=substrate_service/index.html>" > ./crate-docs/index.html
 
 
 
 
 #### stage:                        publish
 
-publish:docker:release:
+.publish_build:                    &publish_build
   stage:                           publish
   dependencies:
     - build:rust:linux:release
   cache: {}
-  only:
-    - master
-    - tags
-    - web
-  tags:
-    - shell
+  <<:                              *build_only
+  <<:                              *kubernetes_build
+
+
+
+publish:docker:release:
+  <<:                              *publish_build
+  image:                           docker:stable
+  services:
+    - docker:dind
+  # collect VERSION artifact here to pass it on to kubernetes
+  <<:                              *collect_artifacts
   variables:
-    DOCKERFILE: scripts/docker/Dockerfile
-    CONTAINER_IMAGE: parity/substrate
-  before_script:
+    DOCKER_HOST:                   tcp://localhost:2375
+    DOCKER_DRIVER:                 overlay2
+    GIT_STRATEGY:                  none
+    # DOCKERFILE:                  scripts/docker/Dockerfile
+    CONTAINER_IMAGE:               parity/substrate
+  script:
+    - VERSION="$(cat ./artifacts/VERSION)"
     - test "$Docker_Hub_User_Parity" -a "$Docker_Hub_Pass_Parity"
         || ( echo "no docker credentials provided"; exit 1 )
     - docker login -u "$Docker_Hub_User_Parity" -p "$Docker_Hub_Pass_Parity"
     - docker info
-    - VERSION="$(./target/release/substrate --version | sed -n -r 's/^substrate ([0-9.]+-.*-[0-9a-f]{8})-.*$/\1/p')"
-    - export VERSION
-    - echo "Substrate version = ${VERSION}"
-  script:
-    # - CONTAINER_TAG="${CI_COMMIT_TAG:-latest}"
-    # - docker build --tag $CONTAINER_IMAGE:$CI_BUILD_REF --tag $CONTAINER_IMAGE:$CONTAINER_TAG -f $DOCKERFILE ./target/release/
-    # - docker push $CONTAINER_IMAGE:$CONTAINER_TAG
-    - test -z "${VERSION}" && exit 1
-    - docker build --tag $CONTAINER_IMAGE:$VERSION --tag $CONTAINER_IMAGE:latest -f $DOCKERFILE ./target/release/
+    - cd ./artifacts
+    - docker build --tag $CONTAINER_IMAGE:$VERSION --tag $CONTAINER_IMAGE:latest .
     - docker push $CONTAINER_IMAGE:$VERSION
     - docker push $CONTAINER_IMAGE:latest
   after_script:
     - docker logout
+    # only VERSION information is needed for the deployment
+    - find ./artifacts/ -depth -not -name VERSION -not -name artifacts -delete
+
+
+
+
+publish:s3:release:
+  <<:                              *publish_build
+  image:                           parity/awscli:latest
+  variables:
+    GIT_STRATEGY:                  none
+    BUCKET:                        "releases.parity.io"
+    PREFIX:                        "substrate/${ARCH}-${DOCKER_OS}"
+  script:
+    - aws s3 sync ./artifacts/ s3://${BUCKET}/${PREFIX}/$(cat ./artifacts/VERSION)/
+    - echo "update objects in latest path"
+    - for file in ./artifacts/*; do
+      name="$(basename ${file})";
+      aws s3api copy-object
+        --copy-source ${BUCKET}/${PREFIX}/$(cat ./artifacts/VERSION)/${name}
+        --bucket ${BUCKET} --key ${PREFIX}/latest/${name};
+      done
+  after_script:
+    - aws s3 ls s3://${BUCKET}/${PREFIX}/latest/
+        --recursive --human-readable --summarize
+
+
+
+publish:s3:doc:
+  stage:                           publish
+  allow_failure:                   true
+  dependencies:
+    - build:rust:doc:release
+  cache: {}
+  <<:                              *build_only
+  <<:                              *kubernetes_build
+  variables:
+    GIT_STRATEGY:                  none
+    BUCKET:                        "releases.parity.io"
+    PREFIX:                        "substrate-rustdoc"
+  script:
+    - test -r ./crate-docs/index.html || (
+        echo "./crate-docs/index.html not present, build:rust:doc:release job not complete";
+        exit 1
+      )
+    - aws s3 sync --delete --size-only --only-show-errors
+        ./crate-docs/ s3://${BUCKET}/${PREFIX}/
+  after_script:
+    - aws s3 ls s3://${BUCKET}/${PREFIX}/
+        --human-readable --summarize
+
+
+
+
+
+
+
+.deploy:template:                  &deploy
+  stage:                           deploy
+  when:                            manual
+  cache:                           {}
+  dependencies:
+    - publish:docker:release
+  retry:                           1
+  image:                           parity/kubectl-helm:$HELM_VERSION
+  <<:                              *build_only
+  # variables:
+  #   DEPLOY_TAG:                    "latest"
+  tags:
+    - kubernetes-parity-build
+  before_script:
+    - test -z "${DEPLOY_TAG}" &&
+      test -f ./artifacts/VERSION &&
+      DEPLOY_TAG="$(cat ./artifacts/VERSION)"
+    - test "${DEPLOY_TAG}" || ( echo "Neither DEPLOY_TAG nor VERSION information available"; exit 1 )
+  script:
+    - echo "Substrate version = ${DEPLOY_TAG}"
+    # or use helm to render the template
+    - helm template
+      --values ./scripts/kubernetes/values.yaml
+      --set image.tag=${DEPLOY_TAG}
+      --set validator.keys=${VALIDATOR_KEYS}
+      ./scripts/kubernetes | kubectl apply -f - --dry-run=false
+    - echo "# substrate namespace"
+    - kubectl -n substrate get all
+    - echo "# substrate's nodes' external ip addresses:"
+    - kubectl get nodes -l node=substrate
+      -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{range @.status.addresses[?(@.type=="ExternalIP")]}{.address}{"\n"}{end}'
+    - echo "# substrate' nodes"
+    - kubectl -n substrate get pods
+      -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.spec.nodeName}{"\n"}{end}'
+
+
+
+# have environment:url eventually point to the logs
+
+deploy:ew3:
+  <<:                              *deploy
+  environment:
+    name: parity-prod-ew3
+
+deploy:ue1:
+  <<:                              *deploy
+  environment:
+    name: parity-prod-ue1
+
 
 

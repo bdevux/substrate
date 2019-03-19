@@ -1,4 +1,4 @@
-// Copyright 2017-2018 Parity Technologies (UK) Ltd.
+// Copyright 2017-2019 Parity Technologies (UK) Ltd.
 // This file is part of Substrate.
 
 // Substrate is free software: you can redistribute it and/or modify
@@ -18,41 +18,32 @@
 
 #![cfg_attr(not(feature = "std"), no_std)]
 
-#[allow(unused_imports)]
-#[macro_use]
-extern crate sr_std as rstd;
-
-#[macro_use]
-extern crate srml_support as runtime_support;
-
-extern crate parity_codec;
-#[macro_use]
-extern crate parity_codec_derive;
-
-extern crate sr_primitives as primitives;
-extern crate parity_codec as codec;
-extern crate srml_system as system;
-extern crate substrate_primitives;
-
-#[cfg(test)]
-extern crate sr_io as runtime_io;
-
+#[cfg(feature = "std")]
+use serde_derive::Serialize;
 use rstd::prelude::*;
-use rstd::result;
-use parity_codec::Encode;
-use runtime_support::{storage, Parameter};
-use runtime_support::dispatch::Result;
-use runtime_support::storage::StorageValue;
-use runtime_support::storage::unhashed::StorageVec;
-use primitives::CheckInherentError;
-use primitives::traits::{
-	MaybeSerializeDebug, Member, ProvideInherent, Block as BlockT
-};
+use parity_codec as codec;
+use codec::{Encode, Decode};
+use srml_support::{storage, Parameter, decl_storage, decl_module};
+use srml_support::storage::StorageValue;
+use srml_support::storage::unhashed::StorageVec;
+use primitives::traits::{MaybeSerializeDebug, Member};
 use substrate_primitives::storage::well_known_keys;
 use system::{ensure_signed, ensure_inherent};
+use inherents::{
+	ProvideInherent, InherentData, InherentIdentifier, RuntimeString, MakeFatalError
+};
+
+#[cfg(any(feature = "std", test))]
+use substrate_primitives::ed25519::Public as AuthorityId;
 
 mod mock;
 mod tests;
+
+/// The identifier for consensus inherents.
+pub const INHERENT_IDENTIFIER: InherentIdentifier = *b"offlrep0";
+
+/// The error type used by this inherent.
+pub type InherentError = RuntimeString;
 
 struct AuthorityStorageVec<S: codec::Codec + Default>(rstd::marker::PhantomData<S>);
 impl<S: codec::Codec + Default> StorageVec for AuthorityStorageVec<S> {
@@ -62,12 +53,63 @@ impl<S: codec::Codec + Default> StorageVec for AuthorityStorageVec<S> {
 
 pub type KeyValue = (Vec<u8>, Vec<u8>);
 
-pub trait OnOfflineValidator {
-	fn on_offline_validator(validator_index: usize);
+/// Handling offline validator reports in a generic way.
+pub trait OnOfflineReport<Offline> {
+	fn handle_report(offline: Offline);
 }
 
-impl OnOfflineValidator for () {
-	fn on_offline_validator(_validator_index: usize) {}
+impl<T> OnOfflineReport<T> for () {
+	fn handle_report(_: T) {}
+}
+
+/// Describes the offline-reporting extrinsic.
+pub trait InherentOfflineReport {
+	/// The report data type passed to the runtime during block authorship.
+	type Inherent: codec::Codec + Parameter;
+
+	/// Whether an inherent is empty and doesn't need to be included.
+	fn is_empty(inherent: &Self::Inherent) -> bool;
+
+	/// Handle the report.
+	fn handle_report(report: Self::Inherent);
+
+	/// Whether two reports are compatible.
+	fn check_inherent(contained: &Self::Inherent, expected: &Self::Inherent) -> Result<(), &'static str>;
+}
+
+impl InherentOfflineReport for () {
+	type Inherent = ();
+
+	fn is_empty(_inherent: &()) -> bool { true }
+	fn handle_report(_: ()) { }
+	fn check_inherent(_: &(), _: &()) -> Result<(), &'static str> {
+		Err("Explicit reporting not allowed")
+	}
+}
+
+/// A variant of the `OfflineReport` which is useful for instant-finality blocks.
+///
+/// This assumes blocks are only finalized
+pub struct InstantFinalityReportVec<T>(::rstd::marker::PhantomData<T>);
+
+impl<T: OnOfflineReport<Vec<u32>>> InherentOfflineReport for InstantFinalityReportVec<T> {
+	type Inherent = Vec<u32>;
+
+	fn is_empty(inherent: &Self::Inherent) -> bool { inherent.is_empty() }
+
+	fn handle_report(report: Vec<u32>) {
+		T::handle_report(report)
+	}
+
+	fn check_inherent(contained: &Self::Inherent, expected: &Self::Inherent) -> Result<(), &'static str> {
+		contained.iter().try_for_each(|n|
+			if !expected.contains(n) {
+				Err("Node we believe online marked offline")
+			} else {
+				Ok(())
+			}
+		)
+	}
 }
 
 pub type Log<T> = RawLog<
@@ -93,26 +135,25 @@ impl<SessionKey: Member> RawLog<SessionKey> {
 
 // Implementation for tests outside of this crate.
 #[cfg(any(feature = "std", test))]
-impl<N> From<RawLog<N>> for primitives::testing::DigestItem where N: Into<u64> {
+impl<N> From<RawLog<N>> for primitives::testing::DigestItem where N: Into<AuthorityId> {
 	fn from(log: RawLog<N>) -> primitives::testing::DigestItem {
 		match log {
 			RawLog::AuthoritiesChange(authorities) =>
-				primitives::generic::DigestItem::AuthoritiesChange
-					::<substrate_primitives::H256, u64>(authorities.into_iter()
+				primitives::generic::DigestItem::AuthoritiesChange(
+					authorities.into_iter()
 						.map(Into::into).collect()),
 		}
 	}
 }
 
 pub trait Trait: system::Trait {
-	/// The allowed extrinsic position for `note_offline` inherent.
-	const NOTE_OFFLINE_POSITION: u32;
-
 	/// Type for all log entries of this module.
 	type Log: From<Log<Self>> + Into<system::DigestItemOf<Self>>;
 
 	type SessionKey: Parameter + Default + MaybeSerializeDebug;
-	type OnOfflineValidator: OnOfflineValidator;
+	/// Defines the offline-report type of the trait.
+	/// Set to `()` if offline-reports aren't needed for this runtime.
+	type InherentOfflineReport: InherentOfflineReport;
 }
 
 decl_storage! {
@@ -126,7 +167,7 @@ decl_storage! {
 		#[serde(with = "substrate_primitives::bytes")]
 		config(code): Vec<u8>;
 
-		build(|storage: &mut primitives::StorageMap, _: &mut primitives::ChildrenStorageMap, config: &GenesisConfig<T>| {
+		build(|storage: &mut primitives::StorageOverlay, _: &mut primitives::ChildrenStorageOverlay, config: &GenesisConfig<T>| {
 			use codec::{Encode, KeyedVec};
 
 			let auth_count = config.authorities.len() as u32;
@@ -142,54 +183,37 @@ decl_storage! {
 decl_module! {
 	pub struct Module<T: Trait> for enum Call where origin: T::Origin {
 		/// Report some misbehaviour.
-		fn report_misbehavior(origin, _report: Vec<u8>) -> Result {
+		fn report_misbehavior(origin, _report: Vec<u8>) {
 			ensure_signed(origin)?;
-			// TODO.
-			Ok(())
 		}
 
 		/// Note the previous block's validator missed their opportunity to propose a block.
-		/// This only comes in if 2/3+1 of the validators agree that no proposal was submitted.
-		/// It's only relevant for the previous block.
-		fn note_offline(origin, offline_val_indices: Vec<u32>) -> Result {
+		fn note_offline(origin, offline: <T::InherentOfflineReport as InherentOfflineReport>::Inherent) {
 			ensure_inherent(origin)?;
-			assert!(
-				<system::Module<T>>::extrinsic_index() == Some(T::NOTE_OFFLINE_POSITION),
-				"note_offline extrinsic must be at position {} in the block",
-				T::NOTE_OFFLINE_POSITION
-			);
 
-			for validator_index in offline_val_indices.into_iter() {
-				T::OnOfflineValidator::on_offline_validator(validator_index as usize);
-			}
-
-			Ok(())
+			T::InherentOfflineReport::handle_report(offline);
 		}
 
 		/// Make some on-chain remark.
-		fn remark(origin, _remark: Vec<u8>) -> Result {
+		fn remark(origin, _remark: Vec<u8>) {
 			ensure_signed(origin)?;
-			Ok(())
 		}
 
 		/// Set the number of pages in the WebAssembly environment's heap.
-		fn set_heap_pages(pages: u64) -> Result {
+		fn set_heap_pages(pages: u64) {
 			storage::unhashed::put_raw(well_known_keys::HEAP_PAGES, &pages.encode());
-			Ok(())
 		}
 
 		/// Set the new code.
-		pub fn set_code(new: Vec<u8>) -> Result {
+		pub fn set_code(new: Vec<u8>) {
 			storage::unhashed::put_raw(well_known_keys::CODE, &new);
-			Ok(())
 		}
 
 		/// Set some items of storage.
-		fn set_storage(items: Vec<KeyValue>) -> Result {
+		fn set_storage(items: Vec<KeyValue>) {
 			for i in &items {
 				storage::unhashed::put_raw(&i.0, &i.1);
 			}
-			Ok(())
 		}
 
 		fn on_finalise() {
@@ -247,29 +271,38 @@ impl<T: Trait> Module<T> {
 }
 
 impl<T: Trait> ProvideInherent for Module<T> {
-	type Inherent = Vec<u32>;
 	type Call = Call<T>;
+	type Error = MakeFatalError<RuntimeString>;
+	const INHERENT_IDENTIFIER: InherentIdentifier = INHERENT_IDENTIFIER;
 
-	fn create_inherent_extrinsics(data: Self::Inherent) -> Vec<(u32, Self::Call)> {
-		vec![(T::NOTE_OFFLINE_POSITION, Call::note_offline(data))]
+	fn create_inherent(data: &InherentData) -> Option<Self::Call> {
+		if let Ok(Some(data)) =
+			data.get_data::<<T::InherentOfflineReport as InherentOfflineReport>::Inherent>(
+				&INHERENT_IDENTIFIER
+			)
+		{
+			if <T::InherentOfflineReport as InherentOfflineReport>::is_empty(&data) {
+				None
+			} else {
+				Some(Call::note_offline(data))
+			}
+		} else {
+			None
+		}
 	}
 
-	fn check_inherent<Block: BlockT, F: Fn(&Block::Extrinsic) -> Option<&Self::Call>>(
-		block: &Block, data: Self::Inherent, extract_function: &F
-	) -> result::Result<(), CheckInherentError> {
-		let noted_offline = block
-			.extrinsics().get(T::NOTE_OFFLINE_POSITION as usize)
-			.and_then(|xt| match extract_function(&xt) {
-				Some(Call::note_offline(ref x)) => Some(&x[..]),
-				_ => None,
-			}).unwrap_or(&[]);
+	fn check_inherent(call: &Self::Call, data: &InherentData) -> Result<(), Self::Error> {
+		let offline = match call {
+			Call::note_offline(ref offline) => offline,
+			_ => return Ok(()),
+		};
 
-		noted_offline.iter().try_for_each(|n|
-			if !data.contains(n) {
-				Err(CheckInherentError::Other("Online node marked offline".into()))
-			} else {
-				Ok(())
-			}
-		)
+		let expected = data
+			.get_data::<<T::InherentOfflineReport as InherentOfflineReport>::Inherent>(&INHERENT_IDENTIFIER)?
+			.ok_or(RuntimeString::from("No `offline_report` found in the inherent data!"))?;
+
+		<T::InherentOfflineReport as InherentOfflineReport>::check_inherent(
+			&offline, &expected
+		).map_err(|e| RuntimeString::from(e).into())
 	}
 }

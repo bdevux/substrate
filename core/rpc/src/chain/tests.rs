@@ -1,4 +1,4 @@
-// Copyright 2017-2018 Parity Technologies (UK) Ltd.
+// Copyright 2017-2019 Parity Technologies (UK) Ltd.
 // This file is part of Substrate.
 
 // Substrate is free software: you can redistribute it and/or modify
@@ -15,9 +15,9 @@
 // along with Substrate.  If not, see <http://www.gnu.org/licenses/>.
 
 use super::*;
-use jsonrpc_macros::pubsub;
+use assert_matches::assert_matches;
 use test_client::{self, TestClient};
-use test_client::runtime::{Block, Header};
+use test_client::runtime::{H256, Block, Header};
 use consensus::BlockOrigin;
 
 #[test]
@@ -33,7 +33,7 @@ fn should_return_header() {
 	assert_matches!(
 		client.header(Some(client.client.genesis_hash()).into()),
 		Ok(Some(ref x)) if x == &Header {
-			parent_hash: 0.into(),
+			parent_hash: H256::from_low_u64_be(0),
 			number: 0,
 			state_root: x.state_root.clone(),
 			extrinsics_root: "03170a2e7597b7b7e3d84c05391d139a62b157e78786d8c082f29dcf4c111314".parse().unwrap(),
@@ -44,7 +44,7 @@ fn should_return_header() {
 	assert_matches!(
 		client.header(None.into()),
 		Ok(Some(ref x)) if x == &Header {
-			parent_hash: 0.into(),
+			parent_hash: H256::from_low_u64_be(0),
 			number: 0,
 			state_root: x.state_root.clone(),
 			extrinsics_root: "03170a2e7597b7b7e3d84c05391d139a62b157e78786d8c082f29dcf4c111314".parse().unwrap(),
@@ -53,7 +53,7 @@ fn should_return_header() {
 	);
 
 	assert_matches!(
-		client.header(Some(5.into()).into()),
+		client.header(Some(H256::from_low_u64_be(5)).into()),
 		Ok(None)
 	);
 }
@@ -70,13 +70,12 @@ fn should_return_a_block() {
 
 	let block = api.client.new_block().unwrap().bake().unwrap();
 	let block_hash = block.hash();
-	api.client.justify_and_import(BlockOrigin::Own, block).unwrap();
+	api.client.import(BlockOrigin::Own, block).unwrap();
 
-
-	// Genesis block is not justified, so we can't query it?
+	// Genesis block is not justified
 	assert_matches!(
 		api.block(Some(api.client.genesis_hash()).into()),
-		Ok(None)
+		Ok(Some(SignedBlock { justification: None, .. }))
 	);
 
 	assert_matches!(
@@ -108,7 +107,7 @@ fn should_return_a_block() {
 	);
 
 	assert_matches!(
-		api.block(Some(5.into()).into()),
+		api.block(Some(H256::from_low_u64_be(5)).into()),
 		Ok(None)
 	);
 }
@@ -130,24 +129,28 @@ fn should_return_block_hash() {
 
 
 	assert_matches!(
-		client.block_hash(Some(0u64).into()),
+		client.block_hash(Some(0u64.into()).into()),
 		Ok(Some(ref x)) if x == &client.client.genesis_hash()
 	);
 
 	assert_matches!(
-		client.block_hash(Some(1u64).into()),
+		client.block_hash(Some(1u64.into()).into()),
 		Ok(None)
 	);
 
 	let block = client.client.new_block().unwrap().bake().unwrap();
-	client.client.justify_and_import(BlockOrigin::Own, block.clone()).unwrap();
+	client.client.import(BlockOrigin::Own, block.clone()).unwrap();
 
 	assert_matches!(
-		client.block_hash(Some(0u64).into()),
+		client.block_hash(Some(0u64.into()).into()),
 		Ok(Some(ref x)) if x == &client.client.genesis_hash()
 	);
 	assert_matches!(
-		client.block_hash(Some(1u64).into()),
+		client.block_hash(Some(1u64.into()).into()),
+		Ok(Some(ref x)) if x == &block.hash()
+	);
+	assert_matches!(
+		client.block_hash(Some(::primitives::U256::from(1u64).into()).into()),
 		Ok(Some(ref x)) if x == &block.hash()
 	);
 }
@@ -170,7 +173,7 @@ fn should_return_finalised_hash() {
 
 	// import new block
 	let builder = client.client.new_block().unwrap();
-	client.client.justify_and_import(BlockOrigin::Own, builder.bake().unwrap()).unwrap();
+	client.client.import(BlockOrigin::Own, builder.bake().unwrap()).unwrap();
 	// no finalisation yet
 	assert_matches!(
 		client.finalised_head(),
@@ -178,7 +181,7 @@ fn should_return_finalised_hash() {
 	);
 
 	// finalise
-	client.client.finalize_block(BlockId::number(1), true).unwrap();
+	client.client.finalize_block(BlockId::number(1), None, true).unwrap();
 	assert_matches!(
 		client.finalised_head(),
 		Ok(ref x) if x == &client.client.block_hash(1).unwrap().unwrap()
@@ -189,7 +192,7 @@ fn should_return_finalised_hash() {
 fn should_notify_about_latest_block() {
 	let mut core = ::tokio::runtime::Runtime::new().unwrap();
 	let remote = core.executor();
-	let (subscriber, id, transport) = pubsub::Subscriber::new_test("test");
+	let (subscriber, id, transport) = Subscriber::new_test("test");
 
 	{
 		let api = Chain {
@@ -203,7 +206,7 @@ fn should_notify_about_latest_block() {
 		assert_eq!(core.block_on(id), Ok(Ok(SubscriptionId::Number(1))));
 
 		let builder = api.client.new_block().unwrap();
-		api.client.justify_and_import(BlockOrigin::Own, builder.bake().unwrap()).unwrap();
+		api.client.import(BlockOrigin::Own, builder.bake().unwrap()).unwrap();
 	}
 
 	// assert initial head sent.
@@ -220,7 +223,7 @@ fn should_notify_about_latest_block() {
 fn should_notify_about_finalised_block() {
 	let mut core = ::tokio::runtime::Runtime::new().unwrap();
 	let remote = core.executor();
-	let (subscriber, id, transport) = pubsub::Subscriber::new_test("test");
+	let (subscriber, id, transport) = Subscriber::new_test("test");
 
 	{
 		let api = Chain {
@@ -234,8 +237,8 @@ fn should_notify_about_finalised_block() {
 		assert_eq!(core.block_on(id), Ok(Ok(SubscriptionId::Number(1))));
 
 		let builder = api.client.new_block().unwrap();
-		api.client.justify_and_import(BlockOrigin::Own, builder.bake().unwrap()).unwrap();
-		api.client.finalize_block(BlockId::number(1), true).unwrap();
+		api.client.import(BlockOrigin::Own, builder.bake().unwrap()).unwrap();
+		api.client.finalize_block(BlockId::number(1), None, true).unwrap();
 	}
 
 	// assert initial head sent.
@@ -246,27 +249,4 @@ fn should_notify_about_finalised_block() {
 	assert!(notification.is_some());
 	// no more notifications on this channel
 	assert_eq!(core.block_on(next.into_future()).unwrap().0, None);
-}
-
-#[test]
-fn should_return_runtime_version() {
-	let core = ::tokio::runtime::Runtime::new().unwrap();
-	let remote = core.executor();
-
-	let client = Chain {
-		client: Arc::new(test_client::new()),
-		subscriptions: Subscriptions::new(remote),
-	};
-
-	assert_matches!(
-		client.runtime_version(None.into()),
-		Ok(ref ver) if ver == &RuntimeVersion {
-			spec_name: "test".into(),
-			impl_name: "parity-test".into(),
-			authoring_version: 1,
-			spec_version: 1,
-			impl_version: 1,
-			apis: (&[][..]).into()
-		}
-	);
 }

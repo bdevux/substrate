@@ -1,0 +1,15 @@
+[package]
+name = "substrate-consensus-aura-primitives"
+version = "0.1.0"
+authors = ["Parity Technologies <admin@parity.io>"]
+description = "Primitives for Aura consensus"
+edition = "2018"
+
+[dependencies]
+substrate-client = { path = "../../../client", default-features = false }
+
+[features]
+default = ["std"]
+std = [
+	"substrate-client/std",
+]
