@@ -16,3 +16,6 @@ node/runtime/wasm/target/
 polkadot.*
 .DS_Store
 .idea/
+docs/diagrams/out/*
+**/*.pu
+**/docs
