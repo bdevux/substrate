@@ -19,3 +19,7 @@ polkadot.*
 docs/diagrams/out/*
 **/*.pu
 **/docs
+nohup.out
+rls*.log
+*.orig
+*.rej

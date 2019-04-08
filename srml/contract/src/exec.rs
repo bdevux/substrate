@@ -14,16 +14,15 @@
 // You should have received a copy of the GNU General Public License
 // along with Substrate. If not, see <http://www.gnu.org/licenses/>.
 
-use super::{CodeHash, Config, ContractAddressFor, Event, RawEvent, Trait};
+use super::{CodeHash, Config, ContractAddressFor, Event, RawEvent, Trait, TrieId, BalanceOf, AccountInfoOf};
 use crate::account_db::{AccountDb, DirectAccountDb, OverlayAccountDb};
 use crate::gas::{GasMeter, Token, approx_gas_for_balance};
 
 use rstd::prelude::*;
 use runtime_primitives::traits::{CheckedAdd, CheckedSub, Zero};
-use srml_support::traits::WithdrawReason;
+use srml_support::{StorageMap, traits::{WithdrawReason, Currency}};
 use timestamp;
 
-pub type BalanceOf<T> = <T as balances::Trait>::Balance;
 pub type AccountIdOf<T> = <T as system::Trait>::AccountId;
 pub type CallOf<T> = <T as Trait>::Call;
 pub type MomentOf<T> = <T as timestamp::Trait>::Moment;
@@ -43,7 +42,7 @@ pub struct CallReceipt {
 /// An interface that provides access to the external environment in which the
 /// smart-contract is executed.
 ///
-/// This interface is specialised to an account of the executing code, so all
+/// This interface is specialized to an account of the executing code, so all
 /// operations are implicitly performed on that account.
 pub trait Ext {
 	type T: Trait;
@@ -90,7 +89,6 @@ pub trait Ext {
 	/// Returns a reference to the account id of the current contract.
 	fn address(&self) -> &AccountIdOf<Self::T>;
 
-
 	/// Returns the balance of the current contract.
 	///
 	/// The `value_transferred` is already added.
@@ -104,6 +102,9 @@ pub trait Ext {
 
 	/// Returns a reference to the random seed for the current block
 	fn random_seed(&self) -> &SeedOf<Self::T>;
+
+	/// Deposit an event.
+	fn deposit_event(&mut self, data: Vec<u8>);
 }
 
 /// Loader is a companion of the `Vm` trait. It loads an appropriate abstract
@@ -225,6 +226,7 @@ impl<T: Trait> Token<T> for ExecFeeToken {
 
 pub struct ExecutionContext<'a, T: Trait + 'a, V, L> {
 	pub self_account: T::AccountId,
+	pub self_trie_id: Option<TrieId>,
 	pub overlay: OverlayAccountDb<'a, T>,
 	pub depth: usize,
 	pub events: Vec<Event<T>>,
@@ -244,11 +246,11 @@ where
 	///
 	/// The specified `origin` address will be used as `sender` for
 	pub fn top_level(origin: T::AccountId, cfg: &'a Config<T>, vm: &'a V, loader: &'a L) -> Self {
-		let overlay = OverlayAccountDb::<T>::new(&DirectAccountDb);
 		ExecutionContext {
+			self_trie_id: <AccountInfoOf<T>>::get(&origin).map(|s| s.trie_id),
 			self_account: origin,
+			overlay: OverlayAccountDb::<T>::new(&DirectAccountDb),
 			depth: 0,
-			overlay,
 			events: Vec::new(),
 			calls: Vec::new(),
 			config: &cfg,
@@ -259,8 +261,9 @@ where
 
 	fn nested(&self, overlay: OverlayAccountDb<'a, T>, dest: T::AccountId) -> Self {
 		ExecutionContext {
-			overlay: overlay,
+			self_trie_id: <AccountInfoOf<T>>::get(&dest).map(|s| s.trie_id),
 			self_account: dest,
+			overlay,
 			depth: self.depth + 1,
 			events: Vec::new(),
 			calls: Vec::new(),
@@ -274,7 +277,7 @@ where
 	pub fn call(
 		&mut self,
 		dest: T::AccountId,
-		value: T::Balance,
+		value: BalanceOf<T>,
 		gas_meter: &mut GasMeter<T>,
 		input_data: &[u8],
 		empty_output_buf: EmptyOutputBuf,
@@ -299,7 +302,7 @@ where
 				dest.clone()
 			);
 
-			if value > T::Balance::zero() {
+			if value > BalanceOf::<T>::zero() {
 				transfer(
 					gas_meter,
 					TransferCause::Call,
@@ -342,7 +345,7 @@ where
 
 	pub fn instantiate(
 		&mut self,
-		endowment: T::Balance,
+		endowment: BalanceOf<T>,
 		gas_meter: &mut GasMeter<T>,
 		code_hash: &CodeHash<T>,
 		input_data: &[u8],
@@ -371,6 +374,7 @@ where
 
 		let (change_set, events, calls) = {
 			let mut overlay = OverlayAccountDb::new(&self.overlay);
+				
 			overlay.set_code(&dest, Some(code_hash.clone()));
 			let mut nested = self.nested(overlay, dest.clone());
 
@@ -431,7 +435,7 @@ pub struct TransferFeeToken<Balance> {
 	gas_price: Balance,
 }
 
-impl<T: Trait> Token<T> for TransferFeeToken<T::Balance> {
+impl<T: Trait> Token<T> for TransferFeeToken<BalanceOf<T>> {
 	type Metadata = Config<T>;
 
 	#[inline]
@@ -460,7 +464,7 @@ enum TransferCause {
 /// (transfering endowment) or because of a transfer via `call`. This
 /// is specified using the `cause` parameter.
 ///
-/// NOTE: that the fee is denominated in `T::Balance` units, but
+/// NOTE: that the fee is denominated in `BalanceOf<T>` units, but
 /// charged in `T::Gas` from the provided `gas_meter`. This means
 /// that the actual amount charged might differ.
 ///
@@ -472,7 +476,7 @@ fn transfer<'a, T: Trait, V: Vm<T>, L: Loader<T>>(
 	cause: TransferCause,
 	transactor: &T::AccountId,
 	dest: &T::AccountId,
-	value: T::Balance,
+	value: BalanceOf<T>,
 	ctx: &mut ExecutionContext<'a, T, V, L>,
 ) -> Result<(), &'static str> {
 	use self::TransferCause::*;
@@ -520,7 +524,7 @@ fn transfer<'a, T: Trait, V: Vm<T>, L: Loader<T>>(
 	if would_create && value < ctx.config.existential_deposit {
 		return Err("value too low to create account");
 	}
-	<balances::Module<T>>::ensure_account_can_withdraw(transactor, value, WithdrawReason::Transfer, new_from_balance)?;
+	T::Currency::ensure_can_withdraw(transactor, value, WithdrawReason::Transfer, new_from_balance)?;
 
 	let new_to_balance = match to_balance.checked_add(&value) {
 		Some(b) => b,
@@ -540,7 +544,7 @@ fn transfer<'a, T: Trait, V: Vm<T>, L: Loader<T>>(
 struct CallContext<'a, 'b: 'a, T: Trait + 'b, V: Vm<T> + 'b, L: Loader<T>> {
 	ctx: &'a mut ExecutionContext<'b, T, V, L>,
 	caller: T::AccountId,
-	value_transferred: T::Balance,
+	value_transferred: BalanceOf<T>,
 	timestamp: T::Moment,
 	random_seed: T::Hash,
 }
@@ -554,7 +558,7 @@ where
 	type T = T;
 
 	fn get_storage(&self, key: &[u8]) -> Option<Vec<u8>> {
-		self.ctx.overlay.get_storage(&self.ctx.self_account, key)
+		self.ctx.overlay.get_storage(&self.ctx.self_account, self.ctx.self_trie_id.as_ref(), key)
 	}
 
 	fn set_storage(&mut self, key: &[u8], value: Option<Vec<u8>>) {
@@ -566,7 +570,7 @@ where
 	fn instantiate(
 		&mut self,
 		code_hash: &CodeHash<T>,
-		endowment: T::Balance,
+		endowment: BalanceOf<T>,
 		gas_meter: &mut GasMeter<T>,
 		input_data: &[u8],
 	) -> Result<InstantiateReceipt<AccountIdOf<T>>, &'static str> {
@@ -576,7 +580,7 @@ where
 	fn call(
 		&mut self,
 		to: &T::AccountId,
-		value: T::Balance,
+		value: BalanceOf<T>,
 		gas_meter: &mut GasMeter<T>,
 		input_data: &[u8],
 		empty_output_buf: EmptyOutputBuf,
@@ -600,11 +604,11 @@ where
 		&self.caller
 	}
 
-	fn balance(&self) -> T::Balance {
+	fn balance(&self) -> BalanceOf<T> {
 		self.ctx.overlay.get_balance(&self.ctx.self_account)
 	}
 
-	fn value_transferred(&self) -> T::Balance {
+	fn value_transferred(&self) -> BalanceOf<T> {
 		self.value_transferred
 	}
 
@@ -614,6 +618,10 @@ where
 
 	fn now(&self) -> &T::Moment {
 		&self.timestamp
+	}
+
+	fn deposit_event(&mut self, data: Vec<u8>) {
+		self.ctx.events.push(RawEvent::Contract(self.ctx.self_account.clone(), data));
 	}
 }
 
@@ -639,9 +647,9 @@ mod tests {
 	use crate::{CodeHash, Config};
 	use runtime_io::with_externalities;
 	use std::cell::RefCell;
+	use std::rc::Rc;
 	use std::collections::HashMap;
 	use std::marker::PhantomData;
-	use std::rc::Rc;
 	use assert_matches::assert_matches;
 
 	const ALICE: u64 = 1;

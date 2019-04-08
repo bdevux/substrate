@@ -16,15 +16,17 @@
 
 //! Auxilliaries to help with managing partial changes to accounts state.
 
-use super::{CodeHash, CodeHashOf, StorageOf, Trait};
-use {balances, system};
+use super::{CodeHash, CodeHashOf, Trait, TrieId, AccountInfoOf, BalanceOf, AccountInfo, TrieIdGenerator};
+use system;
 use rstd::cell::RefCell;
 use rstd::collections::btree_map::{BTreeMap, Entry};
 use rstd::prelude::*;
-use srml_support::{StorageMap, StorageDoubleMap, traits::UpdateBalanceOutcome};
+use runtime_primitives::traits::Zero;
+use srml_support::{StorageMap, traits::{UpdateBalanceOutcome,
+	SignedImbalance, Currency, Imbalance}, storage::child};
 
 pub struct ChangeEntry<T: Trait> {
-	balance: Option<T::Balance>,
+	balance: Option<BalanceOf<T>>,
 	/// In the case the outer option is None, the code_hash remains untouched, while providing `Some(None)` signifies a removing of the code in question
 	code: Option<Option<CodeHash<T>>>,
 	storage: BTreeMap<Vec<u8>, Option<Vec<u8>>>,
@@ -44,60 +46,101 @@ impl<T: Trait> Default for ChangeEntry<T> {
 pub type ChangeSet<T> = BTreeMap<<T as system::Trait>::AccountId, ChangeEntry<T>>;
 
 pub trait AccountDb<T: Trait> {
-	fn get_storage(&self, account: &T::AccountId, location: &[u8]) -> Option<Vec<u8>>;
+	/// Account is used when overlayed otherwise trie_id must be provided.
+	/// This is for performance reason.
+	///
+	/// Trie id can be None iff account doesn't have an associated trie id in <AccountInfoOf<T>>.
+	/// Because DirectAccountDb bypass the lookup for this association.
+	fn get_storage(&self, account: &T::AccountId, trie_id: Option<&TrieId>, location: &[u8]) -> Option<Vec<u8>>;
 	fn get_code(&self, account: &T::AccountId) -> Option<CodeHash<T>>;
-	fn get_balance(&self, account: &T::AccountId) -> T::Balance;
+	fn get_balance(&self, account: &T::AccountId) -> BalanceOf<T>;
 
 	fn commit(&mut self, change_set: ChangeSet<T>);
 }
 
 pub struct DirectAccountDb;
 impl<T: Trait> AccountDb<T> for DirectAccountDb {
-	fn get_storage(&self, account: &T::AccountId, location: &[u8]) -> Option<Vec<u8>> {
-		<StorageOf<T>>::get(account, &location.to_vec())
+	fn get_storage(&self, _account: &T::AccountId, trie_id: Option<&TrieId>, location: &[u8]) -> Option<Vec<u8>> {
+		trie_id.and_then(|id| child::get_raw(id, location))
 	}
 	fn get_code(&self, account: &T::AccountId) -> Option<CodeHash<T>> {
 		<CodeHashOf<T>>::get(account)
 	}
-	fn get_balance(&self, account: &T::AccountId) -> T::Balance {
-		balances::Module::<T>::free_balance(account)
+	fn get_balance(&self, account: &T::AccountId) -> BalanceOf<T> {
+		T::Currency::free_balance(account)
 	}
 	fn commit(&mut self, s: ChangeSet<T>) {
+		let mut total_imbalance = SignedImbalance::zero();
 		for (address, changed) in s.into_iter() {
 			if let Some(balance) = changed.balance {
-				if let UpdateBalanceOutcome::AccountKilled =
-					balances::Module::<T>::set_free_balance_creating(&address, balance)
-				{
+				let (imbalance, outcome) = T::Currency::make_free_balance_be(&address, balance);
+				total_imbalance = total_imbalance.merge(imbalance);
+				if let UpdateBalanceOutcome::AccountKilled = outcome {
 					// Account killed. This will ultimately lead to calling `OnFreeBalanceZero` callback
-					// which will make removal of CodeHashOf and StorageOf for this account.
+					// which will make removal of CodeHashOf and AccountStorage for this account.
 					// In order to avoid writing over the deleted properties we `continue` here.
 					continue;
 				}
 			}
-			if let Some(code) = changed.code {
-				if let Some(code) = code {
-					<CodeHashOf<T>>::insert(&address, code);
+			if changed.code.is_some() || !changed.storage.is_empty() {
+				let mut info = if !<AccountInfoOf<T>>::exists(&address) {
+					let info = AccountInfo {
+						trie_id: <T as Trait>::TrieIdGenerator::trie_id(&address),
+						storage_size: 0,
+					};
+					<AccountInfoOf<T>>::insert(&address, &info);
+					info
 				} else {
-					<CodeHashOf<T>>::remove(&address);
+					<AccountInfoOf<T>>::get(&address).unwrap()
+				};
+
+				if let Some(code) = changed.code {
+					if let Some(code) = code {
+						<CodeHashOf<T>>::insert(&address, code);
+					} else {
+						<CodeHashOf<T>>::remove(&address);
+					}
 				}
-			}
-			for (k, v) in changed.storage.into_iter() {
-				if let Some(value) = v {
-					<StorageOf<T>>::insert(&address, &k, value);
-				} else {
-					<StorageOf<T>>::remove(&address, &k);
+
+				let mut new_storage_size = info.storage_size;
+				for (k, v) in changed.storage.into_iter() {
+					if let Some(value) = child::get::<Vec<u8>>(&info.trie_id[..], &k) {
+						new_storage_size -= value.len() as u64;
+					}
+					if let Some(value) = v {
+						new_storage_size += value.len() as u64;
+						child::put_raw(&info.trie_id[..], &k, &value[..]);
+					} else {
+						child::kill(&info.trie_id[..], &k);
+					}
+				}
+
+				if new_storage_size != info.storage_size {
+					info.storage_size = new_storage_size;
+					<AccountInfoOf<T>>::insert(&address, info);
 				}
 			}
 		}
+
+		match total_imbalance {
+			// If we've detected a positive imbalance as a result of our contract-level machinations
+			// then it's indicative of a buggy contracts system.
+			// Panicking is far from ideal as it opens up a DoS attack on block validators, however
+			// it's a less bad option than allowing arbitrary value to be created.
+			SignedImbalance::Positive(ref p) if !p.peek().is_zero() =>
+				panic!("contract subsystem resulting in positive imbalance!"),
+			_ => {}
+		}
 	}
 }
-
 pub struct OverlayAccountDb<'a, T: Trait + 'a> {
 	local: RefCell<ChangeSet<T>>,
 	underlying: &'a AccountDb<T>,
 }
 impl<'a, T: Trait> OverlayAccountDb<'a, T> {
-	pub fn new(underlying: &'a AccountDb<T>) -> OverlayAccountDb<'a, T> {
+	pub fn new(
+		underlying: &'a AccountDb<T>,
+	) -> OverlayAccountDb<'a, T> {
 		OverlayAccountDb {
 			local: RefCell::new(ChangeSet::new()),
 			underlying,
@@ -114,13 +157,13 @@ impl<'a, T: Trait> OverlayAccountDb<'a, T> {
 		location: Vec<u8>,
 		value: Option<Vec<u8>>,
 	) {
-		self.local
-			.borrow_mut()
+		self.local.borrow_mut()
 			.entry(account.clone())
 			.or_insert(Default::default())
 			.storage
 			.insert(location, value);
 	}
+
 	pub fn set_code(&mut self, account: &T::AccountId, code: Option<CodeHash<T>>) {
 		self.local
 			.borrow_mut()
@@ -128,7 +171,7 @@ impl<'a, T: Trait> OverlayAccountDb<'a, T> {
 			.or_insert(Default::default())
 			.code = Some(code);
 	}
-	pub fn set_balance(&mut self, account: &T::AccountId, balance: T::Balance) {
+	pub fn set_balance(&mut self, account: &T::AccountId, balance: BalanceOf<T>) {
 		self.local
 			.borrow_mut()
 			.entry(account.clone())
@@ -138,13 +181,13 @@ impl<'a, T: Trait> OverlayAccountDb<'a, T> {
 }
 
 impl<'a, T: Trait> AccountDb<T> for OverlayAccountDb<'a, T> {
-	fn get_storage(&self, account: &T::AccountId, location: &[u8]) -> Option<Vec<u8>> {
+	fn get_storage(&self, account: &T::AccountId, trie_id: Option<&TrieId>, location: &[u8]) -> Option<Vec<u8>> {
 		self.local
 			.borrow()
 			.get(account)
 			.and_then(|a| a.storage.get(location))
 			.cloned()
-			.unwrap_or_else(|| self.underlying.get_storage(account, location))
+			.unwrap_or_else(|| self.underlying.get_storage(account, trie_id, location))
 	}
 	fn get_code(&self, account: &T::AccountId) -> Option<CodeHash<T>> {
 		self.local
@@ -153,7 +196,7 @@ impl<'a, T: Trait> AccountDb<T> for OverlayAccountDb<'a, T> {
 			.and_then(|a| a.code.clone())
 			.unwrap_or_else(|| self.underlying.get_code(account))
 	}
-	fn get_balance(&self, account: &T::AccountId) -> T::Balance {
+	fn get_balance(&self, account: &T::AccountId) -> BalanceOf<T> {
 		self.local
 			.borrow()
 			.get(account)

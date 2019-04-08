@@ -24,17 +24,21 @@ use runtime_primitives::testing::{Digest, DigestItem, H256, Header, UintAuthorit
 use runtime_primitives::traits::{BlakeTwo256, IdentityLookup};
 use runtime_primitives::BuildStorage;
 use runtime_io;
-use srml_support::{StorageMap, StorageDoubleMap, assert_ok, impl_outer_event, impl_outer_dispatch, impl_outer_origin};
-use substrate_primitives::{Blake2Hasher};
+use srml_support::{storage::child, StorageMap, assert_ok, impl_outer_event, impl_outer_dispatch,
+	impl_outer_origin, traits::Currency};
+use substrate_primitives::Blake2Hasher;
 use system::{self, Phase, EventRecord};
-use fees;
 use {wabt, balances, consensus};
 use hex_literal::*;
 use assert_matches::assert_matches;
 use crate::{
-	ContractAddressFor, GenesisConfig, Module, RawEvent, StorageOf,
-	Trait, ComputeDispatchFee
+	ContractAddressFor, GenesisConfig, Module, RawEvent,
+	Trait, ComputeDispatchFee, TrieIdGenerator, TrieId,
+	AccountInfo, AccountInfoOf,
 };
+use substrate_primitives::storage::well_known_keys;
+use parity_codec::{Encode, Decode, KeyedVec};
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 mod contract {
 	// Re-export contents of the root. This basically
@@ -45,7 +49,7 @@ mod contract {
 }
 impl_outer_event! {
 	pub enum MetaEvent for Test {
-		balances<T>, contract<T>, fees<T>,
+		balances<T>, contract<T>,
 	}
 }
 impl_outer_origin! {
@@ -68,7 +72,7 @@ impl system::Trait for Test {
 	type Hashing = BlakeTwo256;
 	type Digest = Digest;
 	type AccountId = u64;
-	type Lookup = IdentityLookup<u64>;
+	type Lookup = IdentityLookup<Self::AccountId>;
 	type Header = Header;
 	type Event = MetaEvent;
 	type Log = DigestItem;
@@ -78,6 +82,9 @@ impl balances::Trait for Test {
 	type OnFreeBalanceZero = Contract;
 	type OnNewAccount = ();
 	type Event = MetaEvent;
+	type TransactionPayment = ();
+	type DustRemoval = ();
+	type TransferPayment = ();
 }
 impl timestamp::Trait for Test {
 	type Moment = u64;
@@ -88,16 +95,15 @@ impl consensus::Trait for Test {
 	type SessionKey = UintAuthorityId;
 	type InherentOfflineReport = ();
 }
-impl fees::Trait for Test {
-	type Event = MetaEvent;
-	type TransferAsset = Balances;
-}
 impl Trait for Test {
+	type Currency = Balances;
 	type Call = Call;
 	type Gas = u64;
 	type DetermineContractAddress = DummyContractAddressFor;
 	type Event = MetaEvent;
 	type ComputeDispatchFee = DummyComputeDispatchFee;
+	type TrieIdGenerator = DummyTrieIdGenerator;
+	type GasPayment = ();
 }
 
 type Balances = balances::Module<Test>;
@@ -108,6 +114,17 @@ pub struct DummyContractAddressFor;
 impl ContractAddressFor<H256, u64> for DummyContractAddressFor {
 	fn contract_address_for(_code_hash: &H256, _data: &[u8], origin: &u64) -> u64 {
 		*origin + 1
+	}
+}
+
+static KEY_COUNTER: AtomicUsize = AtomicUsize::new(0);
+
+pub struct DummyTrieIdGenerator;
+impl TrieIdGenerator<u64> for DummyTrieIdGenerator {
+	fn trie_id(account_id: &u64) -> TrieId {
+		let mut res = KEY_COUNTER.fetch_add(1, Ordering::Relaxed).to_le_bytes().to_vec();
+		res.extend_from_slice(&account_id.to_le_bytes());
+		res
 	}
 }
 
@@ -168,6 +185,8 @@ impl ExtBuilder {
 			.0;
 		t.extend(
 			balances::GenesisConfig::<Test> {
+				transaction_base_fee: 0,
+				transaction_byte_fee: 0,
 				balances: vec![],
 				existential_deposit: self.existential_deposit,
 				transfer_fee: self.transfer_fee,
@@ -180,6 +199,10 @@ impl ExtBuilder {
 		);
 		t.extend(
 			GenesisConfig::<Test> {
+				transaction_base_fee: 0,
+				transaction_byte_fee: 0,
+				transfer_fee: self.transfer_fee,
+				creation_fee: self.creation_fee,
 				contract_fee: 21,
 				call_base_fee: 135,
 				create_base_fee: 175,
@@ -199,8 +222,7 @@ impl ExtBuilder {
 #[test]
 fn refunds_unused_gas() {
 	with_externalities(&mut ExtBuilder::default().build(), || {
-		Balances::set_free_balance(&0, 100_000_000);
-		Balances::increase_total_stake_by(100_000_000);
+		Balances::deposit_creating(&0, 100_000_000);
 
 		assert_ok!(Contract::call(
 			Origin::signed(0),
@@ -216,24 +238,33 @@ fn refunds_unused_gas() {
 
 #[test]
 fn account_removal_removes_storage() {
+	let unique_id1 = b"unique_id1";
+	let unique_id2 = b"unique_id2";
 	with_externalities(
 		&mut ExtBuilder::default().existential_deposit(100).build(),
 		|| {
-			// Setup two accounts with free balance above than exsistential threshold.
+			// Set up two accounts with free balance above the existential threshold.
 			{
-				Balances::set_free_balance(&1, 110);
-				Balances::increase_total_stake_by(110);
-				<StorageOf<Test>>::insert(&1, &b"foo".to_vec(), b"1".to_vec());
-				<StorageOf<Test>>::insert(&1, &b"bar".to_vec(), b"2".to_vec());
+				Balances::deposit_creating(&1, 110);
+				AccountInfoOf::<Test>::insert(1, &AccountInfo {
+					trie_id: unique_id1.to_vec(),
+					storage_size: 0,
+				});
+				child::put(&unique_id1[..], &b"foo".to_vec(), &b"1".to_vec());
+				assert_eq!(child::get(&unique_id1[..], &b"foo".to_vec()), Some(b"1".to_vec()));
+				child::put(&unique_id1[..], &b"bar".to_vec(), &b"2".to_vec());
 
-				Balances::set_free_balance(&2, 110);
-				Balances::increase_total_stake_by(110);
-				<StorageOf<Test>>::insert(&2, &b"hello".to_vec(), b"3".to_vec());
-				<StorageOf<Test>>::insert(&2, &b"world".to_vec(), b"4".to_vec());
+				Balances::deposit_creating(&2, 110);
+				AccountInfoOf::<Test>::insert(2, &AccountInfo {
+					trie_id: unique_id2.to_vec(),
+					storage_size: 0,
+				});
+				child::put(&unique_id2[..], &b"hello".to_vec(), &b"3".to_vec());
+				child::put(&unique_id2[..], &b"world".to_vec(), &b"4".to_vec());
 			}
 
 			// Transfer funds from account 1 of such amount that after this transfer
-			// the balance of account 1 is will be below than exsistential threshold.
+			// the balance of account 1 will be below the existential threshold.
 			//
 			// This should lead to the removal of all storage associated with this account.
 			assert_ok!(Balances::transfer(Origin::signed(1), 2, 20));
@@ -241,15 +272,15 @@ fn account_removal_removes_storage() {
 			// Verify that all entries from account 1 is removed, while
 			// entries from account 2 is in place.
 			{
-				assert_eq!(<StorageOf<Test>>::get(&1, &b"foo".to_vec()), None);
-				assert_eq!(<StorageOf<Test>>::get(&1, &b"bar".to_vec()), None);
+				assert_eq!(child::get_raw(&unique_id1[..], &b"foo".to_vec()), None);
+				assert_eq!(child::get_raw(&unique_id1[..], &b"bar".to_vec()), None);
 
 				assert_eq!(
-					<StorageOf<Test>>::get(&2, &b"hello".to_vec()),
+					child::get(&unique_id2[..], &b"hello".to_vec()),
 					Some(b"3".to_vec())
 				);
 				assert_eq!(
-					<StorageOf<Test>>::get(&2, &b"world".to_vec()),
+					child::get(&unique_id2[..], &b"world".to_vec()),
 					Some(b"4".to_vec())
 				);
 			}
@@ -260,10 +291,15 @@ fn account_removal_removes_storage() {
 const CODE_RETURN_FROM_START_FN: &str = r#"
 (module
 	(import "env" "ext_return" (func $ext_return (param i32 i32)))
+	(import "env" "ext_deposit_event" (func $ext_deposit_event (param i32 i32)))
 	(import "env" "memory" (memory 1 1))
 
 	(start $start)
 	(func $start
+		(call $ext_deposit_event
+			(i32.const 8)
+			(i32.const 4)
+		)
 		(call $ext_return
 			(i32.const 8)
 			(i32.const 4)
@@ -279,17 +315,16 @@ const CODE_RETURN_FROM_START_FN: &str = r#"
 	(data (i32.const 8) "\01\02\03\04")
 )
 "#;
-const HASH_RETURN_FROM_START_FN: [u8; 32] = hex!("e6411d12daa2a19e4e9c7d8306c31c7d53a352cb8ed84385c8a1d48fc232e708");
+const HASH_RETURN_FROM_START_FN: [u8; 32] = hex!("abb4194bdea47b2904fe90b4fd674bd40d96f423956627df8c39d2b1a791ab9d");
 
 #[test]
-fn instantiate_and_call() {
+fn instantiate_and_call_and_deposit_event() {
 	let wasm = wabt::wat2wasm(CODE_RETURN_FROM_START_FN).unwrap();
 
 	with_externalities(
 		&mut ExtBuilder::default().existential_deposit(100).build(),
 		|| {
-			Balances::set_free_balance(&ALICE, 1_000_000);
-			Balances::increase_total_stake_by(1_000_000);
+			Balances::deposit_creating(&ALICE, 1_000_000);
 
 			assert_ok!(Contract::put_code(
 				Origin::signed(ALICE),
@@ -297,15 +332,20 @@ fn instantiate_and_call() {
 				wasm,
 			));
 
-			assert_ok!(Contract::create(
+			// Check at the end to get hash on error easily
+			let creation = Contract::create(
 				Origin::signed(ALICE),
 				100,
 				100_000,
 				HASH_RETURN_FROM_START_FN.into(),
 				vec![],
-			));
+			);
 
 			assert_eq!(System::events(), vec![
+				EventRecord {
+					phase: Phase::ApplyExtrinsic(0),
+					event: MetaEvent::balances(balances::RawEvent::NewAccount(1, 1_000_000)),
+				},
 				EventRecord {
 					phase: Phase::ApplyExtrinsic(0),
 					event: MetaEvent::contract(RawEvent::CodeStored(HASH_RETURN_FROM_START_FN.into())),
@@ -322,9 +362,16 @@ fn instantiate_and_call() {
 				},
 				EventRecord {
 					phase: Phase::ApplyExtrinsic(0),
+					event: MetaEvent::contract(RawEvent::Contract(BOB, vec![1, 2, 3, 4]))
+				},
+				EventRecord {
+					phase: Phase::ApplyExtrinsic(0),
 					event: MetaEvent::contract(RawEvent::Instantiated(ALICE, BOB))
 				}
 			]);
+
+			assert_ok!(creation);
+			assert!(AccountInfoOf::<Test>::exists(BOB));
 		},
 	);
 }
@@ -359,8 +406,7 @@ fn dispatch_call() {
 	with_externalities(
 		&mut ExtBuilder::default().existential_deposit(50).build(),
 		|| {
-			Balances::set_free_balance(&ALICE, 1_000_000);
-			Balances::increase_total_stake_by(1_000_000);
+			Balances::deposit_creating(&ALICE, 1_000_000);
 
 			assert_ok!(Contract::put_code(
 				Origin::signed(ALICE),
@@ -371,6 +417,10 @@ fn dispatch_call() {
 			// Let's keep this assert even though it's redundant. If you ever need to update the
 			// wasm source this test will fail and will show you the actual hash.
 			assert_eq!(System::events(), vec![
+				EventRecord {
+					phase: Phase::ApplyExtrinsic(0),
+					event: MetaEvent::balances(balances::RawEvent::NewAccount(1, 1_000_000)),
+				},
 				EventRecord {
 					phase: Phase::ApplyExtrinsic(0),
 					event: MetaEvent::contract(RawEvent::CodeStored(HASH_DISPATCH_CALL.into())),
@@ -394,6 +444,10 @@ fn dispatch_call() {
 			));
 
 			assert_eq!(System::events(), vec![
+				EventRecord {
+					phase: Phase::ApplyExtrinsic(0),
+					event: MetaEvent::balances(balances::RawEvent::NewAccount(1, 1_000_000)),
+				},
 				EventRecord {
 					phase: Phase::ApplyExtrinsic(0),
 					event: MetaEvent::contract(RawEvent::CodeStored(HASH_DISPATCH_CALL.into())),
