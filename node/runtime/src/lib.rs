@@ -53,6 +53,7 @@ pub use balances::Call as BalancesCall;
 pub use runtime_primitives::{Permill, Perbill};
 pub use support::StorageValue;
 pub use staking::StakerStatus;
+mod bdevux;
 
 /// Runtime version.
 pub const VERSION: RuntimeVersion = RuntimeVersion {
@@ -194,6 +195,10 @@ impl finality_tracker::Trait for Runtime {
 	type OnFinalizationStalled = grandpa::SyncedAuthorities<Runtime>;
 }
 
+impl bdevux::Trait for Runtime {
+	type Event = Event;
+}
+
 construct_runtime!(
 	pub enum Runtime with Log(InternalLog: DigestItem<Hash, AuthorityId, AuthoritySignature>) where
 		Block = Block,
@@ -218,6 +223,7 @@ construct_runtime!(
 		Treasury: treasury,
 		Contract: contract::{Module, Call, Storage, Config<T>, Event<T>},
 		Sudo: sudo,
+		Bdevux: bdevux::{Module, Call, Storage, Event<T>},
 	}
 );
 
