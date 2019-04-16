@@ -337,7 +337,7 @@ impl Public {
 			// Invalid version.
 			return Err(PublicError::UnknownVersion);
 		}
-		if d[33..35] != blake2_rfc::blake2b::blake2b(64, &[], &d[0..33]).as_bytes()[0..2] {
+		if d[33..35] != Self::ss58hash(&d[0..33]).as_bytes()[0..2] {
 			// Invalid checksum.
 			return Err(PublicError::InvalidChecksum);
 		}
@@ -348,10 +348,18 @@ impl Public {
 	pub fn to_ss58check(&self) -> String {
 		let mut v = vec![42u8];
 		v.extend(self.as_slice());
-		let r = blake2_rfc::blake2b::blake2b(64, &[], &v);
+		let r = Self::ss58hash(&v);
 		v.extend(&r.as_bytes()[0..2]);
 		v.to_base58()
 	}
+
+	fn ss58hash(data: &[u8]) -> blake2_rfc::blake2b::Blake2bResult {
+		let mut context = blake2_rfc::blake2b::Blake2b::new(64);
+		context.update(b"SS58PRE");
+		context.update(data);
+		context.finalize()
+	}
+
 }
 
 #[cfg(feature = "std")]
