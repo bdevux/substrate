@@ -5,11 +5,9 @@ cargo run --release \-- \
   --key=//Bob \
   --port 30334 \
   --telemetry-url ws://telemetry.polkadot.io:1024 \
-  --validator \
-  --force-authoring
+  --validator
   
-  # --bob \
 # cargo run --release \-- \
 #   purge-chain \
-#   --chain=dev \
+#   --chain=local \
 #   --base-path /tmp/bob

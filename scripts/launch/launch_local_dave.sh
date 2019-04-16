@@ -6,7 +6,6 @@ cargo run --release \-- \
   --port 30335 \
   --telemetry-url ws://telemetry.polkadot.io:1024 
   # --validator \
-  # -ltrace &> dave.log
   
 # cargo run --release \-- \
 #   purge-chain \

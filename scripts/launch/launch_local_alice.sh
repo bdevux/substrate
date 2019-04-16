@@ -1,11 +1,10 @@
 cargo run --release \-- \
   --base-path /tmp/alice \
-  --chain=./dev.json \
+  --chain=local \
   --alice \
   --node-key 0000000000000000000000000000000000000000000000000000000000000001 \
   --telemetry-url ws://telemetry.polkadot.io:1024 \
-  --validator \
-  # --log=staking
+  --validator
 
 # cargo run --release \-- \
 #   purge-chain \
