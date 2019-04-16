@@ -280,9 +280,9 @@ pub fn testnet_genesis(
 		staking: Some(StakingConfig {
 			current_era: 0,
 			minimum_validator_count: 1,
-			validator_count: 2,
+			validator_count: 3,
 			sessions_per_era: 5,
-			bonding_duration: 2 * 60 * 12,
+			bonding_duration: 5 * 30,
 			offline_slash: Perbill::zero(),
 			session_reward: Perbill::zero(),
 			current_session_reward: 0,

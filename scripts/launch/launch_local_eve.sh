@@ -1,15 +1,14 @@
 cargo run --release \-- \
-  --base-path /tmp/bob \
+  --base-path /tmp/eve \
   --bootnodes /ip4/127.0.0.1/tcp/30333/p2p/QmQZ8TjTqeDj3ciwr93EJ95hxfDsb9pEYDizUAbWpigtQN \
-  --chain=./dev.json \
-  --key=//Bob \
-  --port 30334 \
+  --chain=local \
+  --eve \
+  --port 30336 \
   --telemetry-url ws://telemetry.polkadot.io:1024 \
   --validator \
   --force-authoring
   
-  # --bob \
 # cargo run --release \-- \
 #   purge-chain \
-#   --chain=dev \
-#   --base-path /tmp/bob
+#   --chain=local \
+#   --base-path /tmp/eve
