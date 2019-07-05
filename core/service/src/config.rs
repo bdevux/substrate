@@ -16,11 +16,12 @@
 
 //! Service configuration.
 
-use std::net::SocketAddr;
+use std::{path::PathBuf, net::SocketAddr};
 use transaction_pool;
 use crate::chain_spec::ChainSpec;
 pub use client::ExecutionStrategies;
 pub use client_db::PruningMode;
+pub use network::ExtTransport;
 pub use network::config::{NetworkConfiguration, Roles};
 use runtime_primitives::BuildStorage;
 use serde::{Serialize, de::DeserializeOwned};
@@ -43,11 +44,15 @@ pub struct Configuration<C, G: Serialize + DeserializeOwned + BuildStorage> {
 	/// Network configuration.
 	pub network: NetworkConfiguration,
 	/// Path to key files.
-	pub keystore_path: String,
+	pub keystore_path: Option<PathBuf>,
 	/// Path to the database.
-	pub database_path: String,
+	pub database_path: PathBuf,
 	/// Cache Size for internal database in MiB
 	pub database_cache_size: Option<u32>,
+	/// Size of internal state cache in Bytes
+	pub state_cache_size: usize,
+	/// Size in percent of cache size dedicated to child tries 
+	pub state_cache_child_ratio: Option<usize>, 
 	/// Pruning settings.
 	pub pruning: PruningMode,
 	/// Additional key seeds.
@@ -64,10 +69,15 @@ pub struct Configuration<C, G: Serialize + DeserializeOwned + BuildStorage> {
 	pub rpc_http: Option<SocketAddr>,
 	/// RPC over Websockets binding address. `None` if disabled.
 	pub rpc_ws: Option<SocketAddr>,
+	/// Maximum number of connections for WebSockets RPC server. `None` if default.
+	pub rpc_ws_max_connections: Option<usize>,
 	/// CORS settings for HTTP & WS servers. `None` if all origins are allowed.
 	pub rpc_cors: Option<Vec<String>>,
 	/// Telemetry service URL. `None` if disabled.
 	pub telemetry_endpoints: Option<TelemetryEndpoints>,
+	/// External WASM transport for the telemetry. If `Some`, when connection to a telemetry
+	/// endpoint, this transport will be tried in priority before all others.
+	pub telemetry_external_transport: Option<ExtTransport>,
 	/// The default number of 64KB pages to allocate for Wasm execution
 	pub default_heap_pages: Option<u64>,
 	/// Should offchain workers be executed.
@@ -76,6 +86,8 @@ pub struct Configuration<C, G: Serialize + DeserializeOwned + BuildStorage> {
 	pub force_authoring: bool,
 	/// Disable GRANDPA when running in validator mode
 	pub disable_grandpa: bool,
+	/// Node keystore's password
+	pub password: String,
 }
 
 impl<C: Default, G: Serialize + DeserializeOwned + BuildStorage> Configuration<C, G> {
@@ -93,18 +105,23 @@ impl<C: Default, G: Serialize + DeserializeOwned + BuildStorage> Configuration<C
 			keystore_path: Default::default(),
 			database_path: Default::default(),
 			database_cache_size: Default::default(),
+			state_cache_size: Default::default(),
+			state_cache_child_ratio: Default::default(),
 			keys: Default::default(),
 			custom: Default::default(),
 			pruning: PruningMode::default(),
 			execution_strategies: Default::default(),
 			rpc_http: None,
 			rpc_ws: None,
+			rpc_ws_max_connections: None,
 			rpc_cors: Some(vec![]),
 			telemetry_endpoints: None,
+			telemetry_external_transport: None,
 			default_heap_pages: None,
 			offchain_worker: Default::default(),
 			force_authoring: false,
 			disable_grandpa: false,
+			password: "".to_string(),
 		};
 		configuration.network.boot_nodes = configuration.chain_spec.boot_nodes().to_vec();
 

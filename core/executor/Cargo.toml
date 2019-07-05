@@ -1,12 +1,12 @@
 [package]
 name = "substrate-executor"
-version = "1.0.0"
+version = "2.0.0"
 authors = ["Parity Technologies <admin@parity.io>"]
 edition = "2018"
 
 [dependencies]
-error-chain = "0.12"
-parity-codec = "3.3"
+derive_more = "0.15.0"
+parity-codec = "4.1.1"
 runtime_io = { package = "sr-io", path = "../sr-io" }
 primitives = { package = "substrate-primitives", path = "../primitives" }
 trie = { package = "substrate-trie", path = "../trie" }
@@ -14,12 +14,10 @@ serializer = { package = "substrate-serializer", path = "../serializer" }
 state_machine = { package = "substrate-state-machine", path = "../state-machine"  }
 runtime_version = { package = "sr-version", path = "../sr-version" }
 panic-handler = { package = "substrate-panic-handler", path = "../panic-handler" }
-serde = "1.0"
-serde_derive = "1.0"
 wasmi = { version = "0.4.3" }
-byteorder = "1.1"
-lazy_static = "1.0"
-parking_lot = "0.7.1"
+byteorder = "1.3"
+lazy_static = "1.3"
+parking_lot = "0.8.0"
 log = "0.4"
 libsecp256k1 = "0.2.1"
 tiny-keccak = "1.4.2"
@@ -27,7 +25,10 @@ tiny-keccak = "1.4.2"
 [dev-dependencies]
 assert_matches = "1.1"
 wabt = "~0.7.4"
-hex-literal = "0.1.0"
+hex-literal = "0.2.0"
+runtime-test = { package = "substrate-runtime-test", path = "runtime-test" }
+substrate-client = { path = "../client" }
+substrate-offchain = { path = "../offchain/" }
 
 [features]
 default = []

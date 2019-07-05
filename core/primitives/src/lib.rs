@@ -19,7 +19,6 @@
 #![warn(missing_docs)]
 
 #![cfg_attr(not(feature = "std"), no_std)]
-#![cfg_attr(not(feature = "std"), feature(alloc))]
 
 /// Initialize a key-value collection from array.
 ///
@@ -38,7 +37,7 @@ use parity_codec::{Encode, Decode};
 #[cfg(feature = "std")]
 use std::borrow::Cow;
 #[cfg(feature = "std")]
-use serde_derive::{Serialize, Deserialize};
+use serde::{Serialize, Deserialize};
 
 #[cfg(feature = "std")]
 pub use impl_serde::serialize as bytes;
@@ -46,7 +45,7 @@ pub use impl_serde::serialize as bytes;
 #[cfg(feature = "std")]
 pub mod hashing;
 #[cfg(feature = "std")]
-pub use hashing::{blake2_256, twox_128, twox_256};
+pub use hashing::{blake2_128, blake2_256, twox_64, twox_128, twox_256};
 #[cfg(feature = "std")]
 pub mod hexdisplay;
 pub mod crypto;
@@ -57,6 +56,7 @@ pub mod ed25519;
 pub mod sr25519;
 pub mod hash;
 mod hasher;
+pub mod offchain;
 pub mod sandbox;
 pub mod storage;
 pub mod uint;
@@ -69,7 +69,7 @@ pub use self::hash::{H160, H256, H512, convert_hash};
 pub use self::uint::U256;
 pub use changes_trie::ChangesTrieConfiguration;
 #[cfg(feature = "std")]
-pub use crypto::{DeriveJunction, Pair};
+pub use crypto::{DeriveJunction, Pair, Public};
 
 pub use hash_db::Hasher;
 // Switch back to Blake after PoC-3 is out
@@ -86,23 +86,9 @@ pub enum ExecutionContext {
 	/// Context used for block construction.
 	BlockConstruction,
 	/// Offchain worker context.
-	OffchainWorker(Box<OffchainExt>),
+	OffchainWorker(Box<dyn offchain::Externalities>),
 	/// Context used for other calls.
 	Other,
-}
-
-/// An extended externalities for offchain workers.
-pub trait OffchainExt {
-	/// Submits an extrinsics.
-	///
-	/// The extrinsic will either go to the pool (signed)
-	/// or to the next produced block (inherent).
-	fn submit_extrinsic(&mut self, extrinsic: Vec<u8>);
-}
-impl<T: OffchainExt + ?Sized> OffchainExt for Box<T> {
-	fn submit_extrinsic(&mut self, ex: Vec<u8>) {
-		(&mut **self).submit_extrinsic(ex)
-	}
 }
 
 /// Hex-serialized shim for `Vec<u8>`.

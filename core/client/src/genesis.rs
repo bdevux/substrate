@@ -46,14 +46,19 @@ mod tests {
 	use state_machine::backend::InMemory;
 	use test_client::{
 		runtime::genesismap::{GenesisConfig, additional_storage_with_genesis},
-		runtime::{Hash, Transfer, Block, BlockNumber, Header, Digest, Extrinsic},
+		runtime::{Hash, Transfer, Block, BlockNumber, Header, Digest},
 		AccountKeyring, AuthorityKeyring
 	};
 	use runtime_primitives::traits::BlakeTwo256;
 	use primitives::Blake2Hasher;
 	use hex::*;
 
-	native_executor_instance!(Executor, test_client::runtime::api::dispatch, test_client::runtime::native_version, include_bytes!("../../test-runtime/wasm/target/wasm32-unknown-unknown/release/substrate_test_runtime.compact.wasm"));
+	native_executor_instance!(
+		Executor,
+		test_client::runtime::api::dispatch,
+		test_client::runtime::native_version,
+		test_client::runtime::WASM_BINARY
+	);
 
 	fn executor() -> executor::NativeExecutor<Executor> {
 		NativeExecutionDispatch::new(None)
@@ -68,12 +73,7 @@ mod tests {
 	) -> (Vec<u8>, Hash) {
 		use trie::ordered_trie_root;
 
-		let transactions = txs.into_iter().map(|tx| {
-			let signature = AccountKeyring::from_public(&tx.from).unwrap()
-				.sign(&tx.encode()).into();
-
-			Extrinsic::Transfer(tx, signature)
-		}).collect::<Vec<_>>();
+		let transactions = txs.into_iter().map(|tx| tx.into_signed_tx()).collect::<Vec<_>>();
 
 		let extrinsics_root = ordered_trie_root::<Blake2Hasher, _, _>(transactions.iter().map(Encode::encode)).into();
 
@@ -89,7 +89,7 @@ mod tests {
 
 		state_machine::new(
 			backend,
-			Some(&InMemoryChangesTrieStorage::new()),
+			Some(&InMemoryChangesTrieStorage::<_, u64>::new()),
 			state_machine::NeverOffchainExt::new(),
 			&mut overlay,
 			&executor(),
@@ -102,7 +102,7 @@ mod tests {
 		for tx in transactions.iter() {
 			state_machine::new(
 				backend,
-				Some(&InMemoryChangesTrieStorage::new()),
+				Some(&InMemoryChangesTrieStorage::<_, u64>::new()),
 				state_machine::NeverOffchainExt::new(),
 				&mut overlay,
 				&executor(),
@@ -115,7 +115,7 @@ mod tests {
 
 		let (ret_data, _, _) = state_machine::new(
 			backend,
-			Some(&InMemoryChangesTrieStorage::new()),
+			Some(&InMemoryChangesTrieStorage::<_, u64>::new()),
 			state_machine::NeverOffchainExt::new(),
 			&mut overlay,
 			&executor(),
@@ -162,7 +162,7 @@ mod tests {
 		let mut overlay = OverlayedChanges::default();
 		let _ = state_machine::new(
 			&backend,
-			Some(&InMemoryChangesTrieStorage::new()),
+			Some(&InMemoryChangesTrieStorage::<_, u64>::new()),
 			state_machine::NeverOffchainExt::new(),
 			&mut overlay,
 			&executor(),
@@ -191,7 +191,7 @@ mod tests {
 		let mut overlay = OverlayedChanges::default();
 		let _ = state_machine::new(
 			&backend,
-			Some(&InMemoryChangesTrieStorage::new()),
+			Some(&InMemoryChangesTrieStorage::<_, u64>::new()),
 			state_machine::NeverOffchainExt::new(),
 			&mut overlay,
 			&executor(),
@@ -220,7 +220,7 @@ mod tests {
 		let mut overlay = OverlayedChanges::default();
 		let r = state_machine::new(
 			&backend,
-			Some(&InMemoryChangesTrieStorage::new()),
+			Some(&InMemoryChangesTrieStorage::<_, u64>::new()),
 			state_machine::NeverOffchainExt::new(),
 			&mut overlay,
 			&Executor::new(None),

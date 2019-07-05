@@ -19,7 +19,7 @@
 use std::collections::HashMap;
 use std::ops::Deref;
 use lazy_static::lazy_static;
-use substrate_primitives::{sr25519::{Pair, Public, Signature}, Pair as PairT, H256};
+use substrate_primitives::{sr25519::{Pair, Public, Signature}, Pair as PairT, Public as PublicT, H256};
 pub use substrate_primitives::sr25519;
 
 /// Set of test accounts.
@@ -93,6 +93,12 @@ impl From<Keyring> for &'static str {
 			Keyring::One => "One",
 			Keyring::Two => "Two",
 		}
+	}
+}
+
+impl From<Keyring> for sr_primitives::MultiSigner {
+	fn from(x: Keyring) -> Self {
+		sr_primitives::MultiSigner::Sr25519(x.into())
 	}
 }
 

@@ -23,7 +23,7 @@
 #![cfg_attr(not(feature = "std"), no_std)]
 
 #[cfg(feature = "std")]
-use serde_derive::Serialize;
+use serde::Serialize;
 #[cfg(feature = "std")]
 use parity_codec::{Decode, Input};
 use parity_codec::{Encode, Output};
@@ -102,10 +102,7 @@ impl<B, O> serde::Serialize for DecodeDifferent<B, O>
 		B: serde::Serialize + 'static,
 		O: serde::Serialize + 'static,
 {
-	fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-		where
-				S: serde::Serializer,
-	{
+	fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error> where S: serde::Serializer {
 		match self {
 			DecodeDifferent::Encode(b) => b.serialize(serializer),
 			DecodeDifferent::Decoded(o) => o.serialize(serializer),
@@ -162,10 +159,7 @@ impl<E: Encode + ::std::fmt::Debug> std::fmt::Debug for FnEncode<E> {
 
 #[cfg(feature = "std")]
 impl<E: Encode + serde::Serialize> serde::Serialize for FnEncode<E> {
-	fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-		where
-				S: serde::Serializer,
-	{
+	fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error> where S: serde::Serializer {
 		self.0().serialize(serializer)
 	}
 }
@@ -190,21 +184,24 @@ pub struct EventMetadata {
 	pub documentation: DecodeDifferentArray<&'static str, StringBuf>,
 }
 
-/// All the metadata about a storage.
+/// All the metadata about one storage entry.
 #[derive(Clone, PartialEq, Eq, Encode)]
 #[cfg_attr(feature = "std", derive(Decode, Debug, Serialize))]
-pub struct StorageMetadata {
-	pub functions: DecodeDifferentArray<StorageFunctionMetadata>,
+pub struct StorageEntryMetadata {
+	pub name: DecodeDifferentStr,
+	pub modifier: StorageEntryModifier,
+	pub ty: StorageEntryType,
+	pub default: ByteGetter,
+	pub documentation: DecodeDifferentArray<&'static str, StringBuf>,
 }
 
-/// All the metadata about a storage function.
+/// All the metadata about one module constant.
 #[derive(Clone, PartialEq, Eq, Encode)]
 #[cfg_attr(feature = "std", derive(Decode, Debug, Serialize))]
-pub struct StorageFunctionMetadata {
+pub struct ModuleConstantMetadata {
 	pub name: DecodeDifferentStr,
-	pub modifier: StorageFunctionModifier,
-	pub ty: StorageFunctionType,
-	pub default: ByteGetter,
+	pub ty: DecodeDifferentStr,
+	pub value: ByteGetter,
 	pub documentation: DecodeDifferentArray<&'static str, StringBuf>,
 }
 
@@ -238,10 +235,7 @@ impl Eq for DefaultByteGetter { }
 
 #[cfg(feature = "std")]
 impl serde::Serialize for DefaultByteGetter {
-	fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-		where
-				S: serde::Serializer,
-	{
+	fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error> where S: serde::Serializer {
 		self.0.default_byte().serialize(serializer)
 	}
 }
@@ -253,46 +247,43 @@ impl std::fmt::Debug for DefaultByteGetter {
 	}
 }
 
-/// A storage function type.
+/// Hasher used by storage maps
 #[derive(Clone, PartialEq, Eq, Encode)]
 #[cfg_attr(feature = "std", derive(Decode, Debug, Serialize))]
-pub enum StorageFunctionType {
+pub enum StorageHasher {
+	Blake2_128,
+	Blake2_256,
+	Twox128,
+	Twox256,
+	Twox64Concat,
+}
+
+/// A storage entry type.
+#[derive(Clone, PartialEq, Eq, Encode)]
+#[cfg_attr(feature = "std", derive(Decode, Debug, Serialize))]
+pub enum StorageEntryType {
 	Plain(DecodeDifferentStr),
 	Map {
+		hasher: StorageHasher,
 		key: DecodeDifferentStr,
 		value: DecodeDifferentStr,
 		is_linked: bool,
 	},
 	DoubleMap {
+		hasher: StorageHasher,
 		key1: DecodeDifferentStr,
 		key2: DecodeDifferentStr,
 		value: DecodeDifferentStr,
-		key2_hasher: DecodeDifferentStr,
+		key2_hasher: StorageHasher,
 	},
 }
 
-/// A storage function modifier.
+/// A storage entry modifier.
 #[derive(Clone, PartialEq, Eq, Encode)]
 #[cfg_attr(feature = "std", derive(Decode, Debug, Serialize))]
-pub enum StorageFunctionModifier {
+pub enum StorageEntryModifier {
 	Optional,
 	Default,
-}
-
-/// All metadata about the outer dispatch.
-#[derive(Clone, PartialEq, Eq, Encode)]
-#[cfg_attr(feature = "std", derive(Decode, Debug, Serialize))]
-pub struct OuterDispatchMetadata {
-	pub name: DecodeDifferentStr,
-	pub calls: DecodeDifferentArray<OuterDispatchCall>,
-}
-
-/// A Call from the outer dispatch.
-#[derive(Clone, PartialEq, Eq, Encode)]
-#[cfg_attr(feature = "std", derive(Decode, Debug, Serialize))]
-pub struct OuterDispatchCall {
-	pub name: DecodeDifferentStr,
-	pub index: u16,
 }
 
 #[derive(Eq, Encode, PartialEq)]
@@ -312,8 +303,14 @@ pub enum RuntimeMetadata {
 	V1(RuntimeMetadataDeprecated),
 	/// Version 2 for runtime metadata. No longer used.
 	V2(RuntimeMetadataDeprecated),
-	/// Version 3 for runtime metadata.
-	V3(RuntimeMetadataV3),
+	/// Version 3 for runtime metadata. No longer used.
+	V3(RuntimeMetadataDeprecated),
+	/// Version 4 for runtime metadata. No longer used.
+	V4(RuntimeMetadataDeprecated),
+	/// Version 5 for runtime metadata. No longer used.
+	V5(RuntimeMetadataDeprecated),
+	/// Version 6 for runtime metadata.
+	V6(RuntimeMetadataV6),
 }
 
 /// Enum that should fail.
@@ -322,8 +319,7 @@ pub enum RuntimeMetadata {
 pub enum RuntimeMetadataDeprecated { }
 
 impl Encode for RuntimeMetadataDeprecated {
-	fn encode_to<W: Output>(&self, _dest: &mut W) {
-	}
+	fn encode_to<W: Output>(&self, _dest: &mut W) {}
 }
 
 #[cfg(feature = "std")]
@@ -336,7 +332,7 @@ impl Decode for RuntimeMetadataDeprecated {
 /// The metadata of a runtime.
 #[derive(Eq, Encode, PartialEq)]
 #[cfg_attr(feature = "std", derive(Decode, Debug, Serialize))]
-pub struct RuntimeMetadataV3 {
+pub struct RuntimeMetadataV6 {
 	pub modules: DecodeDifferentArray<ModuleMetadata>,
 }
 
@@ -346,12 +342,14 @@ pub struct RuntimeMetadataV3 {
 pub struct ModuleMetadata {
 	pub name: DecodeDifferentStr,
 	pub prefix: DecodeDifferent<FnEncode<&'static str>, StringBuf>,
-	pub storage: ODFnA<StorageFunctionMetadata>,
+	pub storage: ODFnA<StorageEntryMetadata>,
 	pub calls: ODFnA<FunctionMetadata>,
 	pub event: ODFnA<EventMetadata>,
+	pub constants: DFnA<ModuleConstantMetadata>,
 }
 
-type ODFnA<T> = Option<DecodeDifferent<FnEncode<&'static [T]>, Vec<T>>>;
+type ODFnA<T> = Option<DFnA<T>>;
+type DFnA<T> = DecodeDifferent<FnEncode<&'static [T]>, Vec<T>>;
 
 impl Into<primitives::OpaqueMetadata> for RuntimeMetadataPrefixed {
 	fn into(self) -> primitives::OpaqueMetadata {

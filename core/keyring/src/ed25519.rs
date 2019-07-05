@@ -18,7 +18,7 @@
 
 use std::{collections::HashMap, ops::Deref};
 use lazy_static::lazy_static;
-use substrate_primitives::{ed25519::{Pair, Public, Signature}, Pair as PairT, H256};
+use substrate_primitives::{ed25519::{Pair, Public, Signature}, Pair as PairT, Public as PublicT, H256};
 pub use substrate_primitives::ed25519;
 
 /// Set of test accounts.
@@ -79,7 +79,7 @@ impl Keyring {
 			.expect("static values are known good; qed")
 	}
 
-	/// Returns an interator over all test accounts.
+	/// Returns an iterator over all test accounts.
 	pub fn iter() -> impl Iterator<Item=Keyring> {
 		<Self as strum::IntoEnumIterator>::iter()
 	}
@@ -97,6 +97,12 @@ impl From<Keyring> for &'static str {
 			Keyring::One => "One",
 			Keyring::Two => "Two",
 		}
+	}
+}
+
+impl From<Keyring> for sr_primitives::MultiSigner {
+	fn from(x: Keyring) -> Self {
+		sr_primitives::MultiSigner::Ed25519(x.into())
 	}
 }
 

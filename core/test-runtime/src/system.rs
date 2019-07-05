@@ -18,16 +18,17 @@
 //! and depositing logs.
 
 use rstd::prelude::*;
-use runtime_io::{storage_root, enumerated_trie_root, storage_changes_root, twox_128};
+use runtime_io::{storage_root, enumerated_trie_root, storage_changes_root, twox_128, blake2_256};
 use runtime_support::storage::{self, StorageValue, StorageMap};
 use runtime_support::storage_items;
-use runtime_primitives::traits::{Hash as HashT, BlakeTwo256, Digest as DigestT};
+use runtime_primitives::traits::{Hash as HashT, BlakeTwo256, Header as _};
 use runtime_primitives::generic;
 use runtime_primitives::{ApplyError, ApplyOutcome, ApplyResult, transaction_validity::TransactionValidity};
 use parity_codec::{KeyedVec, Encode};
-use super::{AccountId, BlockNumber, Extrinsic, Transfer, H256 as Hash, Block, Header, Digest};
+use super::{
+	AccountId, BlockNumber, Extrinsic, Transfer, H256 as Hash, Block, Header, Digest, AuthorityId
+};
 use primitives::{Blake2Hasher, storage::well_known_keys};
-use primitives::ed25519::Public as AuthorityId;
 
 const NONCE_OF: &[u8] = b"nonce:";
 const BALANCE_OF: &[u8] = b"balance:";
@@ -35,9 +36,11 @@ const BALANCE_OF: &[u8] = b"balance:";
 storage_items! {
 	ExtrinsicData: b"sys:xtd" => required map [ u32 => Vec<u8> ];
 	// The current block number being processed. Set by `execute_block`.
-	Number: b"sys:num" => required BlockNumber;
+	Number: b"sys:num" => BlockNumber;
 	ParentHash: b"sys:pha" => required Hash;
 	NewAuthorities: b"sys:new_auth" => Vec<AuthorityId>;
+	StorageDigest: b"sys:digest" => Digest;
+	Authorities get(authorities): b"sys:auth" => default Vec<AuthorityId>;
 }
 
 pub fn balance_of_key(who: AccountId) -> Vec<u8> {
@@ -45,33 +48,48 @@ pub fn balance_of_key(who: AccountId) -> Vec<u8> {
 }
 
 pub fn balance_of(who: AccountId) -> u64 {
-	storage::get_or(&balance_of_key(who), 0)
+	storage::hashed::get_or(&blake2_256, &balance_of_key(who), 0)
 }
 
 pub fn nonce_of(who: AccountId) -> u64 {
-	storage::get_or(&who.to_keyed_vec(NONCE_OF), 0)
-}
-
-/// Get authorities at given block.
-pub fn authorities() -> Vec<AuthorityId> {
-	let len: u32 = storage::unhashed::get(well_known_keys::AUTHORITY_COUNT)
-		.expect("There are always authorities in test-runtime");
-	(0..len)
-		.map(|i| storage::unhashed::get(&i.to_keyed_vec(well_known_keys::AUTHORITY_PREFIX))
-			.expect("Authority is properly encoded in test-runtime")
-		)
-		.collect()
+	storage::hashed::get_or(&blake2_256, &who.to_keyed_vec(NONCE_OF), 0)
 }
 
 pub fn initialize_block(header: &Header) {
 	// populate environment.
 	<Number>::put(&header.number);
 	<ParentHash>::put(&header.parent_hash);
+	<StorageDigest>::put(header.digest());
 	storage::unhashed::put(well_known_keys::EXTRINSIC_INDEX, &0u32);
+}
+
+pub fn get_block_number() -> Option<BlockNumber> {
+	Number::get()
+}
+
+pub fn take_block_number() -> Option<BlockNumber> {
+	Number::take()
+}
+
+#[derive(Copy, Clone)]
+enum Mode {
+	Verify,
+	Overwrite,
 }
 
 /// Actually execute all transitioning for `block`.
 pub fn polish_block(block: &mut Block) {
+	execute_block_with_state_root_handler(block, Mode::Overwrite);
+}
+
+pub fn execute_block(mut block: Block) {
+	execute_block_with_state_root_handler(&mut block, Mode::Verify);
+}
+
+fn execute_block_with_state_root_handler(
+	block: &mut Block,
+	mode: Mode,
+) {
 	let header = &mut block.header;
 
 	// check transaction trie root represents the transactions.
@@ -79,7 +97,11 @@ pub fn polish_block(block: &mut Block) {
 	let txs = txs.iter().map(Vec::as_slice).collect::<Vec<_>>();
 	let txs_root = enumerated_trie_root::<Blake2Hasher>(&txs).into();
 	info_expect_equal_hash(&txs_root, &header.extrinsics_root);
-	header.extrinsics_root = txs_root;
+	if let Mode::Overwrite = mode {
+		header.extrinsics_root = txs_root;
+	} else {
+		assert!(txs_root == header.extrinsics_root, "Transaction trie root must be valid.");
+	}
 
 	// execute transactions
 	block.extrinsics.iter().enumerate().for_each(|(i, e)| {
@@ -88,50 +110,26 @@ pub fn polish_block(block: &mut Block) {
 		storage::unhashed::kill(well_known_keys::EXTRINSIC_INDEX);
 	});
 
-	header.state_root = storage_root().into();
+	let o_new_authorities = <NewAuthorities>::take();
+
+	if let Mode::Overwrite = mode {
+		header.state_root = storage_root().into();
+	} else {
+		// check storage root.
+		let storage_root = storage_root().into();
+		info_expect_equal_hash(&storage_root, &header.state_root);
+		assert!(storage_root == header.state_root, "Storage root must match that calculated.");
+	}
 
 	// check digest
-	let mut digest = Digest::default();
-	if let Some(storage_changes_root) = storage_changes_root(header.parent_hash.into(), header.number - 1) {
+	let digest = &mut header.digest;
+	if let Some(storage_changes_root) = storage_changes_root(header.parent_hash.into()) {
 		digest.push(generic::DigestItem::ChangesTrieRoot(storage_changes_root.into()));
 	}
-	if let Some(new_authorities) = <NewAuthorities>::take() {
-		digest.push(generic::DigestItem::AuthoritiesChange(new_authorities));
+	if let Some(new_authorities) = o_new_authorities {
+		digest.push(generic::DigestItem::Consensus(*b"aura", new_authorities.encode()));
+		digest.push(generic::DigestItem::Consensus(*b"babe", new_authorities.encode()));
 	}
-	header.digest = digest;
-}
-
-pub fn execute_block(block: Block) {
-	let ref header = block.header;
-
-	// check transaction trie root represents the transactions.
-	let txs = block.extrinsics.iter().map(Encode::encode).collect::<Vec<_>>();
-	let txs = txs.iter().map(Vec::as_slice).collect::<Vec<_>>();
-	let txs_root = enumerated_trie_root::<Blake2Hasher>(&txs).into();
-	info_expect_equal_hash(&txs_root, &header.extrinsics_root);
-	assert!(txs_root == header.extrinsics_root, "Transaction trie root must be valid.");
-
-	// execute transactions
-	block.extrinsics.into_iter().enumerate().for_each(|(i, e)| {
-		storage::unhashed::put(well_known_keys::EXTRINSIC_INDEX, &(i as u32));
-		execute_transaction_backend(&e).unwrap_or_else(|_| panic!("Invalid transaction"));
-		storage::unhashed::kill(well_known_keys::EXTRINSIC_INDEX);
-	});
-
-	// check storage root.
-	let storage_root = storage_root().into();
-	info_expect_equal_hash(&storage_root, &header.state_root);
-	assert!(storage_root == header.state_root, "Storage root must match that calculated.");
-
-	// check digest
-	let mut digest = Digest::default();
-	if let Some(storage_changes_root) = storage_changes_root(header.parent_hash.into(), header.number - 1) {
-		digest.push(generic::DigestItem::ChangesTrieRoot(storage_changes_root.into()));
-	}
-	if let Some(new_authorities) = <NewAuthorities>::take() {
-		digest.push(generic::DigestItem::AuthoritiesChange(new_authorities));
-	}
-	assert!(digest == header.digest, "Header digest items must match that calculated.");
 }
 
 /// The block executor.
@@ -152,7 +150,7 @@ pub fn validate_transaction(utx: Extrinsic) -> TransactionValidity {
 
 	let tx = utx.transfer();
 	let nonce_key = tx.from.to_keyed_vec(NONCE_OF);
-	let expected_nonce: u64 = storage::get_or(&nonce_key, 0);
+	let expected_nonce: u64 = storage::hashed::get_or(&blake2_256, &nonce_key, 0);
 	if tx.nonce < expected_nonce {
 		return TransactionValidity::Invalid(ApplyError::Stale as i8);
 	}
@@ -167,7 +165,9 @@ pub fn validate_transaction(utx: Extrinsic) -> TransactionValidity {
 		let mut deps = Vec::new();
 		deps.push(hash(&tx.from, tx.nonce - 1));
 		deps
-	} else { Vec::new() };
+	} else {
+		Vec::new()
+	};
 
 	let provides = {
 		let mut p = Vec::new();
@@ -180,6 +180,7 @@ pub fn validate_transaction(utx: Extrinsic) -> TransactionValidity {
 		requires,
 		provides,
 		longevity: 64,
+		propagate: true,
 	}
 }
 
@@ -199,18 +200,24 @@ pub fn finalize_block() -> Header {
 	let txs: Vec<_> = (0..extrinsic_index).map(ExtrinsicData::take).collect();
 	let txs = txs.iter().map(Vec::as_slice).collect::<Vec<_>>();
 	let extrinsics_root = enumerated_trie_root::<Blake2Hasher>(&txs).into();
-
-	let number = <Number>::take();
+	// let mut digest = Digest::default();
+	let number = <Number>::take().expect("Number is set by `initialize_block`");
 	let parent_hash = <ParentHash>::take();
-	let storage_root = BlakeTwo256::storage_root();
-	let storage_changes_root = BlakeTwo256::storage_changes_root(parent_hash, number - 1);
+	let mut digest = <StorageDigest>::take().expect("StorageDigest is set by `initialize_block`");
 
-	let mut digest = Digest::default();
+	let o_new_authorities = <NewAuthorities>::take();
+	// This MUST come after all changes to storage are done.  Otherwise we will fail the
+	// “Storage root does not match that calculated” assertion.
+	let storage_root = BlakeTwo256::storage_root();
+	let storage_changes_root = BlakeTwo256::storage_changes_root(parent_hash);
+
 	if let Some(storage_changes_root) = storage_changes_root {
 		digest.push(generic::DigestItem::ChangesTrieRoot(storage_changes_root));
 	}
-	if let Some(new_authorities) = <NewAuthorities>::take() {
-		digest.push(generic::DigestItem::AuthoritiesChange(new_authorities));
+
+	if let Some(new_authorities) = o_new_authorities {
+		digest.push(generic::DigestItem::Consensus(*b"aura", new_authorities.encode()));
+		digest.push(generic::DigestItem::Consensus(*b"babe", new_authorities.encode()));
 	}
 
 	Header {
@@ -235,38 +242,47 @@ fn execute_transaction_backend(utx: &Extrinsic) -> ApplyResult {
 		Extrinsic::Transfer(ref transfer, _) => execute_transfer_backend(transfer),
 		Extrinsic::AuthoritiesChange(ref new_auth) => execute_new_authorities_backend(new_auth),
 		Extrinsic::IncludeData(_) => Ok(ApplyOutcome::Success),
+		Extrinsic::StorageChange(key, value) => execute_storage_change(key, value.as_ref().map(|v| &**v)),
 	}
 }
 
 fn execute_transfer_backend(tx: &Transfer) -> ApplyResult {
 	// check nonce
 	let nonce_key = tx.from.to_keyed_vec(NONCE_OF);
-	let expected_nonce: u64 = storage::get_or(&nonce_key, 0);
+	let expected_nonce: u64 = storage::hashed::get_or(&blake2_256, &nonce_key, 0);
 	if !(tx.nonce == expected_nonce) {
 		return Err(ApplyError::Stale)
 	}
 
 	// increment nonce in storage
-	storage::put(&nonce_key, &(expected_nonce + 1));
+	storage::hashed::put(&blake2_256, &nonce_key, &(expected_nonce + 1));
 
 	// check sender balance
 	let from_balance_key = tx.from.to_keyed_vec(BALANCE_OF);
-	let from_balance: u64 = storage::get_or(&from_balance_key, 0);
+	let from_balance: u64 = storage::hashed::get_or(&blake2_256, &from_balance_key, 0);
 
 	// enact transfer
 	if !(tx.amount <= from_balance) {
 		return Err(ApplyError::CantPay)
 	}
 	let to_balance_key = tx.to.to_keyed_vec(BALANCE_OF);
-	let to_balance: u64 = storage::get_or(&to_balance_key, 0);
-	storage::put(&from_balance_key, &(from_balance - tx.amount));
-	storage::put(&to_balance_key, &(to_balance + tx.amount));
+	let to_balance: u64 = storage::hashed::get_or(&blake2_256, &to_balance_key, 0);
+	storage::hashed::put(&blake2_256, &from_balance_key, &(from_balance - tx.amount));
+	storage::hashed::put(&blake2_256, &to_balance_key, &(to_balance + tx.amount));
 	Ok(ApplyOutcome::Success)
 }
 
 fn execute_new_authorities_backend(new_authorities: &[AuthorityId]) -> ApplyResult {
 	let new_authorities: Vec<AuthorityId> = new_authorities.iter().cloned().collect();
 	<NewAuthorities>::put(new_authorities);
+	Ok(ApplyOutcome::Success)
+}
+
+fn execute_storage_change(key: &[u8], value: Option<&[u8]>) -> ApplyResult {
+	match value {
+		Some(value) => storage::unhashed::put_raw(key, value),
+		None => storage::unhashed::kill(key),
+	}
 	Ok(ApplyOutcome::Success)
 }
 
@@ -295,25 +311,24 @@ fn info_expect_equal_hash(given: &Hash, expected: &Hash) {
 mod tests {
 	use super::*;
 
-	use runtime_io::{with_externalities, twox_128, TestExternalities};
-	use parity_codec::{Joiner, KeyedVec};
-	use substrate_test_client::{AuthorityKeyring, AccountKeyring};
-	use crate::{Header, Transfer};
+	use runtime_io::{with_externalities, TestExternalities};
+	use substrate_test_runtime_client::{AuthorityKeyring, AccountKeyring};
+	use crate::{Header, Transfer, WASM_BINARY};
 	use primitives::{Blake2Hasher, map};
-	use primitives::storage::well_known_keys;
 	use substrate_executor::WasmExecutor;
 
-	const WASM_CODE: &'static [u8] =
-			include_bytes!("../wasm/target/wasm32-unknown-unknown/release/substrate_test_runtime.compact.wasm");
-
 	fn new_test_ext() -> TestExternalities<Blake2Hasher> {
+		let authorities = vec![
+			AuthorityKeyring::Alice.to_raw_public(),
+			AuthorityKeyring::Bob.to_raw_public(),
+			AuthorityKeyring::Charlie.to_raw_public()
+		];
 		TestExternalities::new(map![
 			twox_128(b"latest").to_vec() => vec![69u8; 32],
-			twox_128(well_known_keys::AUTHORITY_COUNT).to_vec() => vec![].and(&3u32),
-			twox_128(&0u32.to_keyed_vec(well_known_keys::AUTHORITY_PREFIX)).to_vec() => AuthorityKeyring::Alice.to_raw_public().to_vec(),
-			twox_128(&1u32.to_keyed_vec(well_known_keys::AUTHORITY_PREFIX)).to_vec() => AuthorityKeyring::Bob.to_raw_public().to_vec(),
-			twox_128(&2u32.to_keyed_vec(well_known_keys::AUTHORITY_PREFIX)).to_vec() => AuthorityKeyring::Charlie.to_raw_public().to_vec(),
-			twox_128(&AccountKeyring::Alice.to_raw_public().to_keyed_vec(b"balance:")).to_vec() => vec![111u8, 0, 0, 0, 0, 0, 0, 0]
+			twox_128(b"sys:auth").to_vec() => authorities.encode(),
+			blake2_256(&AccountKeyring::Alice.to_raw_public().to_keyed_vec(b"balance:")).to_vec() => {
+				vec![111u8, 0, 0, 0, 0, 0, 0, 0]
+			}
 		])
 	}
 
@@ -347,7 +362,7 @@ mod tests {
 	#[test]
 	fn block_import_works_wasm() {
 		block_import_works(|b, ext| {
-			WasmExecutor::new().call(ext, 8, &WASM_CODE, "Core_execute_block", &b.encode()).unwrap();
+			WasmExecutor::new().call(ext, 8, &WASM_BINARY, "Core_execute_block", &b.encode()).unwrap();
 		})
 	}
 
@@ -435,7 +450,7 @@ mod tests {
 	#[test]
 	fn block_import_with_transaction_works_wasm() {
 		block_import_with_transaction_works(|b, ext| {
-			WasmExecutor::new().call(ext, 8, &WASM_CODE, "Core_execute_block", &b.encode()).unwrap();
+			WasmExecutor::new().call(ext, 8, &WASM_BINARY, "Core_execute_block", &b.encode()).unwrap();
 		})
 	}
 }

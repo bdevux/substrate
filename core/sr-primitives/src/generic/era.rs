@@ -17,11 +17,14 @@
 //! Generic implementation of an unchecked (pre-verification) extrinsic.
 
 #[cfg(feature = "std")]
-use serde_derive::{Serialize, Deserialize};
+use serde::{Serialize, Deserialize};
 
 use crate::codec::{Decode, Encode, Input, Output};
 
+/// Era period
 pub type Period = u64;
+
+/// Era phase
 pub type Phase = u64;
 
 /// An era to describe the longevity of a transaction.

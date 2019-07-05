@@ -19,7 +19,6 @@
 
 #![cfg_attr(not(feature = "std"), no_std)]
 #![cfg_attr(not(feature = "std"), feature(core_intrinsics))]
-#![cfg_attr(not(feature = "std"), feature(alloc))]
 
 #![cfg_attr(feature = "std", doc = "Substrate runtime standard library as compiled when linked with Rust's standard library.")]
 #![cfg_attr(not(feature = "std"), doc = "Substrate's runtime standard library as compiled without Rust's standard library.")]
@@ -29,6 +28,32 @@ macro_rules! map {
 	($( $name:expr => $value:expr ),*) => (
 		vec![ $( ( $name, $value ) ),* ].into_iter().collect()
 	)
+}
+
+/// Feature gate some code that should only be run when `std` feature is enabled.
+///
+/// # Example
+///
+/// ```
+/// use sr_std::if_std;
+///
+/// if_std! {
+///     // This code is only being compiled and executed when the `std` feature is enabled.
+///     println!("Hello native world");
+/// }
+/// ```
+#[cfg(feature = "std")]
+#[macro_export]
+macro_rules! if_std {
+	( $( $code:tt )* ) => {
+		$( $code )*
+	}
+}
+
+#[cfg(not(feature = "std"))]
+#[macro_export]
+macro_rules! if_std {
+	( $( $code:tt )* ) => {}
 }
 
 #[cfg(feature = "std")]

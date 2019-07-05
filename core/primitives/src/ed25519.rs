@@ -23,22 +23,16 @@ use crate::{hash::H256, hash::H512};
 use parity_codec::{Encode, Decode};
 
 #[cfg(feature = "std")]
-use untrusted;
-#[cfg(feature = "std")]
 use blake2_rfc;
-#[cfg(feature = "std")]
-use ring::{signature, signature::KeyPair, rand::{SecureRandom, SystemRandom}};
-#[cfg(feature = "std")]
-use base58::{ToBase58, FromBase58};
 #[cfg(feature = "std")]
 use substrate_bip39::seed_from_entropy;
 #[cfg(feature = "std")]
 use bip39::{Mnemonic, Language, MnemonicType};
 #[cfg(feature = "std")]
-use crate::crypto::{Pair as TraitPair, DeriveJunction, SecretStringError, Derive};
+use crate::crypto::{Pair as TraitPair, DeriveJunction, SecretStringError, Derive, Ss58Codec};
 #[cfg(feature = "std")]
 use serde::{de, Serializer, Serialize, Deserializer, Deserialize};
-use crate::crypto::UncheckedFrom;
+use crate::crypto::{key_types, KeyTypeId, Public as TraitPublic, TypedKey, UncheckedFrom};
 
 /// A secret seed. It's not called a "secret key" because ring doesn't expose the secret keys
 /// of the key pair (yeah, dumb); as such we're forced to remember the seed manually if we
@@ -52,12 +46,16 @@ pub struct Public(pub [u8; 32]);
 
 /// A key pair.
 #[cfg(feature = "std")]
-pub struct Pair(signature::Ed25519KeyPair, Seed);
+pub struct Pair(ed25519_dalek::Keypair);
 
 #[cfg(feature = "std")]
 impl Clone for Pair {
 	fn clone(&self) -> Self {
-		Pair::from_seed(self.1.clone())
+		Pair(ed25519_dalek::Keypair {
+			public: self.0.public.clone(),
+			secret: ed25519_dalek::SecretKey::from_bytes(self.0.secret.as_bytes())
+				.expect("key is always the correct size; qed")
+		})
 	}
 }
 
@@ -284,16 +282,6 @@ impl Public {
 		Public(data)
 	}
 
-	/// A new instance from the given slice that should be 32 bytes long.
-	///
-	/// NOTE: No checking goes on to ensure this is a real public key. Only use it if
-	/// you are certain that the array actually is a pubkey. GIGO!
-	pub fn from_slice(data: &[u8]) -> Self {
-		let mut r = [0u8; 32];
-		r.copy_from_slice(data);
-		Public(r)
-	}
-
 	/// A new instance from an H256.
 	///
 	/// NOTE: No checking goes on to ensure this is a real public key. Only use it if
@@ -302,57 +290,39 @@ impl Public {
 		Public(x.into())
 	}
 
-	/// Return a `Vec<u8>` filled with raw data.
-	#[cfg(feature = "std")]
-	pub fn to_raw_vec(self) -> Vec<u8> {
-		let r: &[u8; 32] = self.as_ref();
-		r.to_vec()
-	}
-
-	/// Return a slice filled with raw data.
-	pub fn as_slice(&self) -> &[u8] {
-		let r: &[u8; 32] = self.as_ref();
-		&r[..]
-	}
-
 	/// Return a slice filled with raw data.
 	pub fn as_array_ref(&self) -> &[u8; 32] {
 		self.as_ref()
 	}
 }
 
-#[cfg(feature = "std")]
-impl Derive for Public {}
-
-#[cfg(feature = "std")]
-impl Public {
-	/// Some if the string is a properly encoded SS58Check address.
-	pub fn from_ss58check(s: &str) -> Result<Self, PublicError> {
-		let d = s.from_base58().map_err(|_| PublicError::BadBase58)?;	// failure here would be invalid encoding.
-		if d.len() != 35 {
-			// Invalid length.
-			return Err(PublicError::BadLength);
-		}
-		if d[0] != 42 {
-			// Invalid version.
-			return Err(PublicError::UnknownVersion);
-		}
-		if d[33..35] != blake2_rfc::blake2b::blake2b(64, &[], &d[0..33]).as_bytes()[0..2] {
-			// Invalid checksum.
-			return Err(PublicError::InvalidChecksum);
-		}
-		Ok(Self::from_slice(&d[1..33]))
+impl TraitPublic for Public {
+	/// A new instance from the given slice that should be 32 bytes long.
+	///
+	/// NOTE: No checking goes on to ensure this is a real public key. Only use it if
+	/// you are certain that the array actually is a pubkey. GIGO!
+	fn from_slice(data: &[u8]) -> Self {
+		let mut r = [0u8; 32];
+		r.copy_from_slice(data);
+		Public(r)
 	}
 
-	/// Return the ss58-check string for this key.
-	pub fn to_ss58check(&self) -> String {
-		let mut v = vec![42u8];
-		v.extend(self.as_slice());
-		let r = blake2_rfc::blake2b::blake2b(64, &[], &v);
-		v.extend(&r.as_bytes()[0..2]);
-		v.to_base58()
+	/// Return a `Vec<u8>` filled with raw data.
+	#[cfg(feature = "std")]
+	fn to_raw_vec(&self) -> Vec<u8> {
+		let r: &[u8; 32] = self.as_ref();
+		r.to_vec()
+	}
+
+	/// Return a slice filled with raw data.
+	fn as_slice(&self) -> &[u8] {
+		let r: &[u8; 32] = self.as_ref();
+		&r[..]
 	}
 }
+
+#[cfg(feature = "std")]
+impl Derive for Public {}
 
 #[cfg(feature = "std")]
 impl AsRef<Pair> for Pair {
@@ -385,45 +355,38 @@ impl TraitPair for Pair {
 	type Signature = Signature;
 	type DeriveError = DeriveError;
 
-	/// Generate new secure (random) key pair.
-	///
-	/// This is only for ephemeral keys really, since you won't have access to the secret key
-	/// for storage. If you want a persistent key pair, use `generate_with_phrase` instead.
-	fn generate() -> Pair {
-		let mut seed: Seed = Default::default();
-		SystemRandom::new().fill(seed.as_mut()).expect("system random source should always work! qed");
-		Self::from_seed(seed)
-	}
-
 	/// Generate new secure (random) key pair and provide the recovery phrase.
 	///
 	/// You can recover the same key later with `from_phrase`.
-	fn generate_with_phrase(password: Option<&str>) -> (Pair, String) {
+	fn generate_with_phrase(password: Option<&str>) -> (Pair, String, Seed) {
 		let mnemonic = Mnemonic::new(MnemonicType::Words12, Language::English);
 		let phrase = mnemonic.phrase();
+		let (pair, seed) = Self::from_phrase(phrase, password)
+			.expect("All phrases generated by Mnemonic are valid; qed");
 		(
-			Self::from_phrase(phrase, password).expect("All phrases generated by Mnemonic are valid; qed"),
+			pair,
 			phrase.to_owned(),
+			seed,
 		)
 	}
 
 	/// Generate key pair from given recovery phrase and password.
-	fn from_phrase(phrase: &str, password: Option<&str>) -> Result<Pair, SecretStringError> {
+	fn from_phrase(phrase: &str, password: Option<&str>) -> Result<(Pair, Seed), SecretStringError> {
 		let big_seed = seed_from_entropy(
 			Mnemonic::from_phrase(phrase, Language::English)
 				.map_err(|_| SecretStringError::InvalidPhrase)?.entropy(),
 			password.unwrap_or(""),
 		).map_err(|_| SecretStringError::InvalidSeed)?;
-		Self::from_seed_slice(&big_seed[0..32])
+		let mut seed = Seed::default();
+		seed.copy_from_slice(&big_seed[0..32]);
+		Self::from_seed_slice(&big_seed[0..32]).map(|x| (x, seed))
 	}
 
 	/// Make a new key pair from secret seed material.
 	///
 	/// You should never need to use this; generate(), generate_with_phrasee
-	fn from_seed(seed: Seed) -> Pair {
-		let key = signature::Ed25519KeyPair::from_seed_unchecked(untrusted::Input::from(&seed[..]))
-			.expect("seed has valid length; qed");
-		Pair(key, seed)
+	fn from_seed(seed: &Seed) -> Pair {
+		Self::from_seed_slice(&seed[..]).expect("seed has valid length; qed")
 	}
 
 	/// Make a new key pair from secret seed material. The slice must be 32 bytes long or it
@@ -431,57 +394,52 @@ impl TraitPair for Pair {
 	///
 	/// You should never need to use this; generate(), generate_with_phrase
 	fn from_seed_slice(seed_slice: &[u8]) -> Result<Pair, SecretStringError> {
-		if seed_slice.len() != 32 {
-			Err(SecretStringError::InvalidSeedLength)
-		} else {
-			let mut seed = [0u8; 32];
-			seed.copy_from_slice(&seed_slice);
-			Ok(Self::from_seed(seed))
-		}
+		let secret = ed25519_dalek::SecretKey::from_bytes(seed_slice)
+			.map_err(|_| SecretStringError::InvalidSeedLength)?;
+		let public = ed25519_dalek::PublicKey::from(&secret);
+		Ok(Pair(ed25519_dalek::Keypair { secret, public }))
 	}
 
 	/// Derive a child key from a series of given junctions.
 	fn derive<Iter: Iterator<Item=DeriveJunction>>(&self, path: Iter) -> Result<Pair, DeriveError> {
-		let mut acc = self.1.clone();
+		let mut acc = self.0.secret.to_bytes();
 		for j in path {
 			match j {
 				DeriveJunction::Soft(_cc) => return Err(DeriveError::SoftKeyInPath),
 				DeriveJunction::Hard(cc) => acc = derive_hard_junction(&acc, &cc),
 			}
 		}
-		Ok(Self::from_seed(acc))
+		Ok(Self::from_seed(&acc))
 	}
 
 	/// Generate a key from the phrase, password and derivation path.
-	fn from_standard_components<I: Iterator<Item=DeriveJunction>>(phrase: &str, password: Option<&str>, path: I) -> Result<Pair, SecretStringError> {
-		Self::from_phrase(phrase, password)?.derive(path).map_err(|_| SecretStringError::InvalidPath)
+	fn from_standard_components<I: Iterator<Item=DeriveJunction>>(
+		phrase: &str,
+		password: Option<&str>,
+		path: I
+	) -> Result<Pair, SecretStringError> {
+		Self::from_phrase(phrase, password)?.0
+			.derive(path)
+			.map_err(|_| SecretStringError::InvalidPath)
 	}
 
 	/// Get the public key.
 	fn public(&self) -> Public {
 		let mut r = [0u8; 32];
-		let pk = self.0.public_key().as_ref();
+		let pk = self.0.public.as_bytes();
 		r.copy_from_slice(pk);
 		Public(r)
 	}
 
 	/// Sign a message.
 	fn sign(&self, message: &[u8]) -> Signature {
-		let mut r = [0u8; 64];
-		r.copy_from_slice(self.0.sign(message).as_ref());
+		let r = self.0.sign(message).to_bytes();
 		Signature::from_raw(r)
 	}
 
 	/// Verify a signature on a message. Returns true if the signature is good.
 	fn verify<P: AsRef<Self::Public>, M: AsRef<[u8]>>(sig: &Self::Signature, message: M, pubkey: P) -> bool {
-		let public_key = untrusted::Input::from(&pubkey.as_ref().0[..]);
-		let msg = untrusted::Input::from(message.as_ref());
-		let sig = untrusted::Input::from(&sig.0[..]);
-
-		match signature::verify(&signature::ED25519, public_key, msg, sig) {
-			Ok(_) => true,
-			_ => false,
-		}
+		Self::verify_weak(&sig.0[..], message.as_ref(), &pubkey.as_ref().0[..])
 	}
 
 	/// Verify a signature on a message. Returns true if the signature is good.
@@ -489,14 +447,25 @@ impl TraitPair for Pair {
 	/// This doesn't use the type system to ensure that `sig` and `pubkey` are the correct
 	/// size. Use it only if you're coming from byte buffers and need the speed.
 	fn verify_weak<P: AsRef<[u8]>, M: AsRef<[u8]>>(sig: &[u8], message: M, pubkey: P) -> bool {
-		let public_key = untrusted::Input::from(pubkey.as_ref());
-		let msg = untrusted::Input::from(message.as_ref());
-		let sig = untrusted::Input::from(sig);
+		let public_key = match ed25519_dalek::PublicKey::from_bytes(pubkey.as_ref()) {
+			Ok(pk) => pk,
+			Err(_) => return false,
+		};
 
-		match signature::verify(&signature::ED25519, public_key, msg, sig) {
+		let sig = match ed25519_dalek::Signature::from_bytes(sig) {
+			Ok(s) => s,
+			Err(_) => return false
+		};
+
+		match public_key.verify(message.as_ref(), &sig) {
 			Ok(_) => true,
 			_ => false,
 		}
+	}
+
+	/// Return a vec filled with raw data.
+	fn to_raw_vec(&self) -> Vec<u8> {
+		self.seed().to_vec()
 	}
 }
 
@@ -504,7 +473,7 @@ impl TraitPair for Pair {
 impl Pair {
 	/// Get the seed for this key.
 	pub fn seed(&self) -> &Seed {
-		&self.1
+		self.0.secret.as_bytes()
 	}
 
 	/// Exactly as `from_string` except that if no matches are found then, the the first 32
@@ -514,15 +483,28 @@ impl Pair {
 			let mut padded_seed: Seed = [' ' as u8; 32];
 			let len = s.len().min(32);
 			padded_seed[..len].copy_from_slice(&s.as_bytes()[..len]);
-			Self::from_seed(padded_seed)
+			Self::from_seed(&padded_seed)
 		})
 	}
+}
+
+impl TypedKey for Public {
+	const KEY_TYPE: KeyTypeId = key_types::ED25519;
+}
+
+impl TypedKey for Signature {
+	const KEY_TYPE: KeyTypeId = key_types::ED25519;
+}
+
+#[cfg(feature = "std")]
+impl TypedKey for Pair {
+	const KEY_TYPE: KeyTypeId = key_types::ED25519;
 }
 
 #[cfg(test)]
 mod test {
 	use super::*;
-	use hex_literal::{hex, hex_impl};
+	use hex_literal::hex;
 	use crate::crypto::DEV_PHRASE;
 
 	#[test]
@@ -534,74 +516,102 @@ mod test {
 	}
 
 	#[test]
+	fn seed_and_derive_should_work() {
+		let seed = hex!("9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60");
+		let pair = Pair::from_seed(&seed);
+		assert_eq!(pair.seed(), &seed);
+		let path = vec![DeriveJunction::Hard([0u8; 32])];
+		let derived = pair.derive(path.into_iter()).ok().unwrap();
+		assert_eq!(
+			derived.seed(),
+			&hex!("ede3354e133f9c8e337ddd6ee5415ed4b4ffe5fc7d21e933f4930a3730e5b21c")
+		);
+	}
+
+	#[test]
 	fn test_vector_should_work() {
-		let pair: Pair = Pair::from_seed(hex!("9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60"));
+		let pair = Pair::from_seed(
+			&hex!("9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60")
+		);
 		let public = pair.public();
-		assert_eq!(public, Public::from_raw(hex!("d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a")));
+		assert_eq!(public, Public::from_raw(
+			hex!("d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a")
+		));
 		let message = b"";
-		let signature = Signature::from_raw(hex!("e5564300c360ac729086e2cc806e828a84877f1eb8e5d974d873e065224901555fb8821590a33bacc61e39701cf9b46bd25bf5f0595bbe24655141438e7a100b"));
+		let signature = hex!("e5564300c360ac729086e2cc806e828a84877f1eb8e5d974d873e065224901555fb8821590a33bacc61e39701cf9b46bd25bf5f0595bbe24655141438e7a100b");
+		let signature = Signature::from_raw(signature);
 		assert!(&pair.sign(&message[..]) == &signature);
 		assert!(Pair::verify(&signature, &message[..], &public));
 	}
 
 	#[test]
 	fn test_vector_by_string_should_work() {
-		let pair: Pair = Pair::from_string("0x9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60", None).unwrap();
+		let pair = Pair::from_string(
+			"0x9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60",
+			None
+		).unwrap();
 		let public = pair.public();
-		assert_eq!(public, Public::from_raw(hex!("d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a")));
+		assert_eq!(public, Public::from_raw(
+			hex!("d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a")
+		));
 		let message = b"";
-		let signature = Signature::from_raw(hex!("e5564300c360ac729086e2cc806e828a84877f1eb8e5d974d873e065224901555fb8821590a33bacc61e39701cf9b46bd25bf5f0595bbe24655141438e7a100b"));
+		let signature = hex!("e5564300c360ac729086e2cc806e828a84877f1eb8e5d974d873e065224901555fb8821590a33bacc61e39701cf9b46bd25bf5f0595bbe24655141438e7a100b");
+		let signature = Signature::from_raw(signature);
 		assert!(&pair.sign(&message[..]) == &signature);
 		assert!(Pair::verify(&signature, &message[..], &public));
 	}
 
 	#[test]
 	fn generated_pair_should_work() {
-		let pair = Pair::generate();
+		let (pair, _) = Pair::generate();
 		let public = pair.public();
 		let message = b"Something important";
 		let signature = pair.sign(&message[..]);
 		assert!(Pair::verify(&signature, &message[..], &public));
+		assert!(!Pair::verify(&signature, b"Something else", &public));
 	}
 
 	#[test]
 	fn seeded_pair_should_work() {
-		let pair = Pair::from_seed(*b"12345678901234567890123456789012");
+		let pair = Pair::from_seed(b"12345678901234567890123456789012");
 		let public = pair.public();
-		assert_eq!(public, Public::from_raw(hex!("2f8c6129d816cf51c374bc7f08c3e63ed156cf78aefb4a6550d97b87997977ee")));
+		assert_eq!(public, Public::from_raw(
+			hex!("2f8c6129d816cf51c374bc7f08c3e63ed156cf78aefb4a6550d97b87997977ee")
+		));
 		let message = hex!("2f8c6129d816cf51c374bc7f08c3e63ed156cf78aefb4a6550d97b87997977ee00000000000000000200d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a4500000000000000");
 		let signature = pair.sign(&message[..]);
 		println!("Correct signature: {:?}", signature);
 		assert!(Pair::verify(&signature, &message[..], &public));
+		assert!(!Pair::verify(&signature, "Other message", &public));
 	}
 
 	#[test]
 	fn generate_with_phrase_recovery_possible() {
-		let (pair1, phrase) = Pair::generate_with_phrase(None);
-		let pair2 = Pair::from_phrase(&phrase, None).unwrap();
+		let (pair1, phrase, _) = Pair::generate_with_phrase(None);
+		let (pair2, _) = Pair::from_phrase(&phrase, None).unwrap();
 
 		assert_eq!(pair1.public(), pair2.public());
 	}
 
 	#[test]
 	fn generate_with_password_phrase_recovery_possible() {
-		let (pair1, phrase) = Pair::generate_with_phrase(Some("password"));
-		let pair2 = Pair::from_phrase(&phrase, Some("password")).unwrap();
+		let (pair1, phrase, _) = Pair::generate_with_phrase(Some("password"));
+		let (pair2, _) = Pair::from_phrase(&phrase, Some("password")).unwrap();
 
 		assert_eq!(pair1.public(), pair2.public());
 	}
 
 	#[test]
 	fn password_does_something() {
-		let (pair1, phrase) = Pair::generate_with_phrase(Some("password"));
-		let pair2 = Pair::from_phrase(&phrase, None).unwrap();
+		let (pair1, phrase, _) = Pair::generate_with_phrase(Some("password"));
+		let (pair2, _) = Pair::from_phrase(&phrase, None).unwrap();
 
 		assert_ne!(pair1.public(), pair2.public());
 	}
 
 	#[test]
 	fn ss58check_roundtrip_works() {
-		let pair = Pair::from_seed(*b"12345678901234567890123456789012");
+		let pair = Pair::from_seed(b"12345678901234567890123456789012");
 		let public = pair.public();
 		let s = public.to_ss58check();
 		println!("Correct: {}", s);

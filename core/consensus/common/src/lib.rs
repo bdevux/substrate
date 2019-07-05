@@ -26,38 +26,31 @@
 // our error-chain could potentially blow up otherwise
 #![recursion_limit="128"]
 
-#[macro_use] extern crate crossbeam_channel;
 #[macro_use] extern crate log;
 
 use std::sync::Arc;
 use std::time::Duration;
 
-use runtime_primitives::generic::BlockId;
-use runtime_primitives::traits::{AuthorityIdFor, Block};
+use runtime_primitives::traits::{Block, DigestFor};
 use futures::prelude::*;
 pub use inherents::InherentData;
 
 pub mod offline_tracker;
 pub mod error;
-mod block_import;
+pub mod block_import;
+mod select_chain;
 pub mod import_queue;
 pub mod evaluation;
 
 // block size limit.
 const MAX_BLOCK_SIZE: usize = 4 * 1024 * 1024 + 512;
 
-pub use self::error::{Error, ErrorKind};
+pub use self::error::Error;
 pub use block_import::{
-	BlockImport, BlockOrigin, ForkChoiceStrategy, ImportedAux, ImportBlock, ImportResult, JustificationImport,
+	BlockImport, BlockOrigin, ForkChoiceStrategy, ImportedAux, ImportBlock, ImportResult,
+	JustificationImport, FinalityProofImport, FinalityProofRequestBuilder,
 };
-
-/// Trait for getting the authorities at a given block.
-pub trait Authorities<B: Block> {
-	type Error: std::error::Error + Send + 'static;
-
-	/// Get the authorities at the given block.
-	fn authorities(&self, at: &BlockId<B>) -> Result<Vec<AuthorityIdFor<B>>, Self::Error>;
-}
+pub use select_chain::SelectChain;
 
 /// Environment producer for a Consensus instance. Creates proposer instance and communication streams.
 pub trait Environment<B: Block> {
@@ -68,7 +61,7 @@ pub trait Environment<B: Block> {
 
 	/// Initialize the proposal logic on top of a specific header. Provide
 	/// the authorities at that header.
-	fn init(&self, parent_header: &B::Header, authorities: &[AuthorityIdFor<B>])
+	fn init(&self, parent_header: &B::Header)
 		-> Result<Self::Proposer, Self::Error>;
 }
 
@@ -84,7 +77,12 @@ pub trait Proposer<B: Block> {
 	/// Future that resolves to a committed proposal.
 	type Create: IntoFuture<Item=B, Error=Self::Error>;
 	/// Create a proposal.
-	fn propose(&self, inherent_data: InherentData, max_duration: Duration) -> Self::Create;
+	fn propose(
+		&self,
+		inherent_data: InherentData,
+		inherent_digests: DigestFor<B>,
+		max_duration: Duration,
+	) -> Self::Create;
 }
 
 /// An oracle for when major synchronization work is being undertaken.

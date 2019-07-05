@@ -24,33 +24,19 @@ pub use srml_metadata::{EventMetadata, DecodeDifferent, OuterEventMetadata, FnEn
 /// # Simple Event Example:
 ///
 /// ```rust
-/// #[macro_use]
-/// extern crate srml_support;
-/// #[macro_use]
-/// extern crate parity_codec as codec;
-/// #[macro_use]
-/// extern crate serde_derive;
-///
-/// decl_event!(
-///	   pub enum Event {
+/// srml_support::decl_event!(
+///    pub enum Event {
 ///       Success,
 ///       Failure(String),
 ///    }
 /// );
+///
 ///# fn main() {}
 /// ```
 ///
 /// # Generic Event Example:
 ///
 /// ```rust
-/// #[macro_use]
-/// extern crate srml_support;
-/// extern crate parity_codec as codec;
-/// #[macro_use]
-/// extern crate parity_codec;
-/// #[macro_use]
-/// extern crate serde_derive;
-///
 /// trait Trait {
 ///     type Balance;
 ///     type Token;
@@ -58,8 +44,8 @@ pub use srml_metadata::{EventMetadata, DecodeDifferent, OuterEventMetadata, FnEn
 ///
 /// mod event1 {
 ///     // Event that specifies the generic parameter explicitly (`Balance`).
-///     decl_event!(
-///	       pub enum Event<T> where Balance = <T as super::Trait>::Balance {
+///     srml_support::decl_event!(
+///        pub enum Event<T> where Balance = <T as super::Trait>::Balance {
 ///           Message(Balance),
 ///        }
 ///     );
@@ -69,8 +55,8 @@ pub use srml_metadata::{EventMetadata, DecodeDifferent, OuterEventMetadata, FnEn
 ///     // Event that uses the generic parameter `Balance`.
 ///     // If no name for the generic parameter is specified explicitly,
 ///     // the name will be taken from the type name of the trait.
-///     decl_event!(
-///	       pub enum Event<T> where <T as super::Trait>::Balance {
+///     srml_support::decl_event!(
+///        pub enum Event<T> where <T as super::Trait>::Balance {
 ///           Message(Balance),
 ///        }
 ///     );
@@ -78,12 +64,13 @@ pub use srml_metadata::{EventMetadata, DecodeDifferent, OuterEventMetadata, FnEn
 ///
 /// mod event3 {
 ///     // And we even support declaring multiple generic parameters!
-///     decl_event!(
-///	       pub enum Event<T> where <T as super::Trait>::Balance, <T as super::Trait>::Token {
+///     srml_support::decl_event!(
+///        pub enum Event<T> where <T as super::Trait>::Balance, <T as super::Trait>::Token {
 ///           Message(Balance, Token),
 ///        }
 ///     );
 /// }
+///
 ///# fn main() {}
 /// ```
 ///
@@ -92,14 +79,6 @@ pub use srml_metadata::{EventMetadata, DecodeDifferent, OuterEventMetadata, FnEn
 /// # Generic Event with Instance Example:
 ///
 /// ```rust
-/// #[macro_use]
-/// extern crate srml_support;
-/// extern crate parity_codec as codec;
-/// #[macro_use]
-/// extern crate parity_codec;
-/// #[macro_use]
-/// extern crate serde_derive;
-///
 ///# struct DefaultInstance;
 ///# trait Instance {}
 ///# impl Instance for DefaultInstance {}
@@ -108,8 +87,8 @@ pub use srml_metadata::{EventMetadata, DecodeDifferent, OuterEventMetadata, FnEn
 ///     type Token;
 /// }
 ///
-/// // For module with instances, DefaultInstance is optionnal
-/// decl_event!(
+/// // For module with instances, DefaultInstance is optional
+/// srml_support::decl_event!(
 ///    pub enum Event<T, I: Instance = DefaultInstance> where
 ///       <T as Trait>::Balance,
 ///       <T as Trait>::Token
@@ -157,6 +136,7 @@ macro_rules! decl_event {
 		}
 		impl Event {
 			#[allow(dead_code)]
+			#[doc(hidden)]
 			pub fn metadata() -> &'static [ $crate::event::EventMetadata ] {
 				$crate::__events_to_metadata!(; $( $events )* )
 			}
@@ -342,17 +322,15 @@ macro_rules! __events_to_metadata {
 }
 
 /// Constructs an Event type for a runtime. This is usually called automatically by the
-/// construct_runtime macro. See also __create_decl_macro.
+/// construct_runtime macro.
 #[macro_export]
 macro_rules! impl_outer_event {
-
 	// Macro transformations (to convert invocations with incomplete parameters to the canonical
 	// form)
-
 	(
 		$(#[$attr:meta])*
 		pub enum $name:ident for $runtime:ident {
-			$( $rest:tt $( <$t:ident $(, $rest_instance:path)? > )*, )*
+			$( $rest_event_without_system:tt )*
 		}
 	) => {
 		$crate::impl_outer_event!(
@@ -360,14 +338,14 @@ macro_rules! impl_outer_event {
 			$name;
 			$runtime;
 			system;
-			Modules { $( $rest $(<$t $(, $rest_instance)? >)*, )* };
+			Modules { $( $rest_event_without_system )* };
 			;
 		);
 	};
 	(
 		$(#[$attr:meta])*
 		pub enum $name:ident for $runtime:ident where system = $system:ident {
-			$( $rest:tt $( <$t:ident $(, $rest_instance:path)? > )*, )*
+			$( $rest_event_with_system:tt )*
 		}
 	) => {
 		$crate::impl_outer_event!(
@@ -375,30 +353,74 @@ macro_rules! impl_outer_event {
 			$name;
 			$runtime;
 			$system;
-			Modules { $( $rest $(<$t $(, $rest_instance)? >)*, )* };
+			Modules { $( $rest_event_with_system )* };
 			;
 		);
 	};
+	// Generic + Instance
 	(
 		$(#[$attr:meta])*;
 		$name:ident;
 		$runtime:ident;
 		$system:ident;
 		Modules {
-			$module:ident<T $(, $instance:path)? >,
-			$( $rest:tt $( <$t:ident $(, $rest_instance:path)? > )*, )*
+			$module:ident $instance:ident<T>,
+			$( $rest_event_generic_instance:tt )*
 		};
-		$( $module_name:ident::Event $( <$generic_param:ident $(, $generic_instance:path)? > )*, )*;
+		$( $module_name:ident::Event $( <$generic_param:ident> )? $( { $generic_instance:ident } )?, )*;
 	) => {
 		$crate::impl_outer_event!(
 			$( #[$attr] )*;
 			$name;
 			$runtime;
 			$system;
-			Modules { $( $rest $(<$t $(, $rest_instance)? >)*, )* };
-			$( $module_name::Event $( <$generic_param $(, $generic_instance)? > )*, )* $module::Event<$runtime $(, $instance)? >,;
+			Modules { $( $rest_event_generic_instance )* };
+			$( $module_name::Event $( <$generic_param> )? $( { $generic_instance } )?, )* $module::Event<$runtime>{ $instance },;
 		);
 	};
+	// Instance
+	(
+		$(#[$attr:meta])*;
+		$name:ident;
+		$runtime:ident;
+		$system:ident;
+		Modules {
+			$module:ident $instance:ident,
+			$( $rest_event_instance:tt )*
+		};
+		$( $module_name:ident::Event $( <$generic_param:ident> )? $( { $generic_instance:ident } )?, )*;
+	) => {
+		$crate::impl_outer_event!(
+			$( #[$attr] )*;
+			$name;
+			$runtime;
+			$system;
+			Modules { $( $rest_event_instance )* };
+			$( $module_name::Event $( <$generic_param> )* $( { $generic_instance } )?, )* $module::Event { $instance },;
+		);
+	};
+	// Generic
+	(
+		$(#[$attr:meta])*;
+		$name:ident;
+		$runtime:ident;
+		$system:ident;
+		Modules {
+			$module:ident<T>,
+			$( $rest_event_generic:tt )*
+		};
+		$( $module_name:ident::Event $( <$generic_param:ident> )? $( { $generic_instance:ident } )?, )*;
+	) => {
+		$crate::impl_outer_event!(
+			$( #[$attr] )*;
+			$name;
+			$runtime;
+			$system;
+			Modules { $( $rest_event_generic )* };
+			$( $module_name::Event $( <$generic_param> )? $( { $generic_instance } )?, )* $module::Event<$runtime>,;
+		);
+	};
+	// No Generic and no Instance
 	(
 		$(#[$attr:meta])*;
 		$name:ident;
@@ -406,30 +428,30 @@ macro_rules! impl_outer_event {
 		$system:ident;
 		Modules {
 			$module:ident,
-			$( $rest:tt )*
+			$( $rest_event_no_generic_no_instance:tt )*
 		};
-		$( $module_name:ident::Event $( <$generic_param:ident $(, $generic_instance:path)? > )*, )*;
+		$( $module_name:ident::Event $( <$generic_param:ident> )? $( { $generic_instance:ident } )?, )*;
 	) => {
 		$crate::impl_outer_event!(
 			$( #[$attr] )*;
 			$name;
 			$runtime;
 			$system;
-			Modules { $( $rest )* };
-			$( $module_name::Event $( <$generic_param $(, $generic_instance)? > )*, )* $module::Event,;
+			Modules { $( $rest_event_no_generic_no_instance )* };
+			$( $module_name::Event $( <$generic_param> )? $( { $generic_instance } )?, )* $module::Event,;
 		);
 	};
 
 	// The main macro expansion that actually renders the Event enum code.
-
 	(
 		$(#[$attr:meta])*;
 		$name:ident;
 		$runtime:ident;
 		$system:ident;
 		Modules {};
-		$( $module_name:ident::Event $( <$generic_param:ident $(, $generic_instance:path)? > )*, )*;
+		$( $module_name:ident::Event $( <$generic_param:ident> )? $( { $generic_instance:ident } )?, )*;
 	) => {
+		$crate::paste::item! {
 		// Workaround for https://github.com/rust-lang/rust/issues/26925 . Remove when sorted.
 		#[derive(Clone, PartialEq, Eq, $crate::codec::Encode, $crate::codec::Decode)]
 		#[cfg_attr(feature = "std", derive(Debug))]
@@ -438,7 +460,9 @@ macro_rules! impl_outer_event {
 		pub enum $name {
 			system($system::Event),
 			$(
-				$module_name( $module_name::Event $( <$generic_param $(, $generic_instance)? > )* ),
+				[< $module_name $(_ $generic_instance )? >](
+					$module_name::Event < $( $generic_param )? $(, $module_name::$generic_instance )? >
+				),
 			)*
 		}
 		impl From<$system::Event> for $name {
@@ -447,17 +471,22 @@ macro_rules! impl_outer_event {
 			}
 		}
 		$(
-			impl From<$module_name::Event $( <$generic_param $(, $generic_instance)? > )*> for $name {
-				fn from(x: $module_name::Event $( <$generic_param $(, $generic_instance)? > )*) -> Self {
-					$name::$module_name(x)
+			impl From<$module_name::Event < $( $generic_param, )? $( $module_name::$generic_instance )? >> for $name {
+				fn from(x: $module_name::Event < $( $generic_param, )? $( $module_name::$generic_instance )? >) -> Self {
+					$name::[< $module_name $(_ $generic_instance )? >](x)
 				}
 			}
 		)*
+		}
 		$crate::__impl_outer_event_json_metadata!(
 			$runtime;
 			$name;
 			$system;
-			$( $module_name::Event $( <$generic_param $(, $generic_instance)? > )*, )*;
+			$(
+				$module_name::Event
+				< $( $generic_param )? $(, $module_name::$generic_instance )? >
+				$( $generic_instance )?,
+			)*;
 		);
 	}
 }
@@ -469,7 +498,7 @@ macro_rules! __impl_outer_event_json_metadata {
 		$runtime:ident;
 		$event_name:ident;
 		$system:ident;
-		$( $module_name:ident::Event $( <$generic_param:ident $(, $generic_instance:path)? > )*, )*;
+		$( $module_name:ident::Event < $( $generic_params:path ),* > $( $instance:ident )?, )*;
 	) => {
 		impl $runtime {
 			#[allow(dead_code)]
@@ -482,7 +511,7 @@ macro_rules! __impl_outer_event_json_metadata {
 							, (
 								stringify!($module_name),
 								$crate::event::FnEncode(
-									$module_name::Event $( ::<$generic_param $(, $generic_instance)? > )* ::metadata
+									$module_name::Event ::< $( $generic_params ),* > ::metadata
 								)
 							)
 						)*
@@ -493,14 +522,17 @@ macro_rules! __impl_outer_event_json_metadata {
 			pub fn __module_events_system() -> &'static [$crate::event::EventMetadata] {
 				system::Event::metadata()
 			}
-			$(
-				#[allow(dead_code)]
-				$crate::paste::item!{
-					pub fn [< __module_events_ $module_name >] () -> &'static [$crate::event::EventMetadata] {
-						$module_name::Event $( ::<$generic_param $(, $generic_instance)? > )* ::metadata()
+
+			$crate::paste::item! {
+				$(
+					#[allow(dead_code)]
+					pub fn [< __module_events_ $module_name $( _ $instance )? >] () ->
+						&'static [$crate::event::EventMetadata]
+					{
+						$module_name::Event ::< $( $generic_params ),* > ::metadata()
 					}
-				}
-			)*
+				)*
+			}
 		}
 	}
 }
@@ -509,8 +541,8 @@ macro_rules! __impl_outer_event_json_metadata {
 #[allow(dead_code)]
 mod tests {
 	use super::*;
-	use serde_derive::Serialize;
-	use parity_codec::{Encode, Decode};
+	use serde::Serialize;
+	use codec::{Encode, Decode};
 
 	mod system {
 		pub trait Trait {
@@ -634,7 +666,7 @@ mod tests {
 		}
 
 		decl_event!(
-			/// Event finish formatting on an named one with trailling comma
+			/// Event finish formatting on an named one with trailing comma
 			pub enum Event<T> where
 				BalanceRenamed = <T as Trait>::Balance,
 				OriginRenamed = <T as Trait>::Origin,

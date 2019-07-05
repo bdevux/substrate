@@ -34,20 +34,31 @@ use substrate_client::{
 	impl_runtime_apis,
 };
 use runtime_primitives::{
-	ApplyResult, transaction_validity::TransactionValidity,
+	ApplyResult,
 	create_runtime_str,
+	transaction_validity::TransactionValidity,
 	traits::{
 		BlindCheckable, BlakeTwo256, Block as BlockT, Extrinsic as ExtrinsicT,
-		GetNodeBlockType, GetRuntimeBlockType, AuthorityIdFor,
+		GetNodeBlockType, GetRuntimeBlockType, Verify
 	},
 };
 use runtime_version::RuntimeVersion;
 pub use primitives::hash::H256;
-use primitives::{ed25519, sr25519, OpaqueMetadata};
+use primitives::{sr25519, OpaqueMetadata};
 #[cfg(any(feature = "std", test))]
 use runtime_version::NativeVersion;
 use inherents::{CheckInherentsResult, InherentData};
 use cfg_if::cfg_if;
+pub use consensus_babe::AuthorityId;
+
+// Ensure Babe and Aura use the same crypto to simplify things a bit.
+pub type AuraId = AuthorityId;
+// Ensure Babe and Aura use the same crypto to simplify things a bit.
+pub type BabeId = AuthorityId;
+
+// Inlucde the WASM binary
+#[cfg(feature = "std")]
+include!(concat!(env!("OUT_DIR"), "/wasm_binary.rs"));
 
 /// Test runtime version.
 pub const VERSION: RuntimeVersion = RuntimeVersion {
@@ -99,11 +110,11 @@ pub enum Extrinsic {
 	AuthoritiesChange(Vec<AuthorityId>),
 	Transfer(Transfer, AccountSignature),
 	IncludeData(Vec<u8>),
+	StorageChange(Vec<u8>, Option<Vec<u8>>),
 }
 
 #[cfg(feature = "std")]
-impl serde::Serialize for Extrinsic
-{
+impl serde::Serialize for Extrinsic {
 	fn serialize<S>(&self, seq: S) -> Result<S::Ok, S::Error> where S: ::serde::Serializer {
 		self.using_encoded(|bytes| seq.serialize_bytes(bytes))
 	}
@@ -122,14 +133,19 @@ impl BlindCheckable for Extrinsic {
 					Err(runtime_primitives::BAD_SIGNATURE)
 				}
 			},
-			Extrinsic::IncludeData(data) => Ok(Extrinsic::IncludeData(data)),
+			Extrinsic::IncludeData(_) => Err(runtime_primitives::BAD_SIGNATURE),
+			Extrinsic::StorageChange(key, value) => Ok(Extrinsic::StorageChange(key, value)),
 		}
 	}
 }
 
 impl ExtrinsicT for Extrinsic {
 	fn is_signed(&self) -> Option<bool> {
-		Some(true)
+		if let Extrinsic::IncludeData(_) = *self {
+			Some(false)
+		} else {
+			Some(true)
+		}
 	}
 }
 
@@ -142,14 +158,10 @@ impl Extrinsic {
 	}
 }
 
-// The identity type used by authorities.
-pub type AuthorityId = ed25519::Public;
-// The signature type used by authorities.
-pub type AuthoritySignature = ed25519::Signature;
-/// An identifier for an account on this system.
-pub type AccountId = sr25519::Public;
-// The signature type used by accounts/transactions.
+/// The signature type used by accounts/transactions.
 pub type AccountSignature = sr25519::Signature;
+/// An identifier for an account on this system.
+pub type AccountId = <AccountSignature as Verify>::Signer;
 /// A simple hash type for all our hashing.
 pub type Hash = H256;
 /// The block number type used in this runtime.
@@ -157,13 +169,13 @@ pub type BlockNumber = u64;
 /// Index of a transaction.
 pub type Index = u64;
 /// The item of a block digest.
-pub type DigestItem = runtime_primitives::generic::DigestItem<H256, AuthorityId, AuthoritySignature>;
+pub type DigestItem = runtime_primitives::generic::DigestItem<H256>;
 /// The digest of a block.
-pub type Digest = runtime_primitives::generic::Digest<DigestItem>;
+pub type Digest = runtime_primitives::generic::Digest<H256>;
 /// A test block.
 pub type Block = runtime_primitives::generic::Block<Header, Extrinsic>;
 /// A test block's header.
-pub type Header = runtime_primitives::generic::Header<BlockNumber, BlakeTwo256, DigestItem>;
+pub type Header = runtime_primitives::generic::Header<BlockNumber, BlakeTwo256>;
 
 /// Run whatever tests we have.
 pub fn run_tests(mut input: &[u8]) -> Vec<u8> {
@@ -240,6 +252,13 @@ cfg_if! {
 				fn use_trie() -> u64;
 				fn benchmark_indirect_call() -> u64;
 				fn benchmark_direct_call() -> u64;
+				/// Returns the initialized block number.
+				fn get_block_number() -> u64;
+				/// Takes and returns the initialized block number.
+				fn take_block_number() -> Option<u64>;
+				/// Returns if no block was initialized.
+				#[skip_initialize_block]
+				fn without_initialize_block() -> bool;
 			}
 		}
 	} else {
@@ -264,6 +283,13 @@ cfg_if! {
 				fn use_trie() -> u64;
 				fn benchmark_indirect_call() -> u64;
 				fn benchmark_direct_call() -> u64;
+				/// Returns the initialized block number.
+				fn get_block_number() -> u64;
+				/// Takes and returns the initialized block number.
+				fn take_block_number() -> Option<u64>;
+				/// Returns if no block was initialized.
+				#[skip_initialize_block]
+				fn without_initialize_block() -> bool;
 			}
 		}
 	}
@@ -334,10 +360,6 @@ cfg_if! {
 				fn initialize_block(header: &<Block as BlockT>::Header) {
 					system::initialize_block(header)
 				}
-
-				fn authorities() -> Vec<AuthorityId> {
-					panic!("Deprecated, please use `AuthoritiesApi`.")
-				}
 			}
 
 			impl client_api::Metadata<Block> for Runtime {
@@ -348,6 +370,16 @@ cfg_if! {
 
 			impl client_api::TaggedTransactionQueue<Block> for Runtime {
 				fn validate_transaction(utx: <Block as BlockT>::Extrinsic) -> TransactionValidity {
+					if let Extrinsic::IncludeData(data) = utx {
+						return TransactionValidity::Valid {
+							priority: data.len() as u64,
+							requires: vec![],
+							provides: vec![data],
+							longevity: 1,
+							propagate: false,
+						};
+					}
+
 					system::validate_transaction(utx)
 				}
 			}
@@ -417,22 +449,41 @@ cfg_if! {
 				fn benchmark_direct_call() -> u64 {
 					(0..1000).fold(0, |p, i| p + benchmark_add_one(i))
 				}
+
+				fn get_block_number() -> u64 {
+					system::get_block_number().expect("Block number is initialized")
+				}
+
+				fn without_initialize_block() -> bool {
+					system::get_block_number().is_none()
+				}
+
+				fn take_block_number() -> Option<u64> {
+					system::take_block_number()
+				}
 			}
 
-			impl consensus_aura::AuraApi<Block> for Runtime {
+			impl consensus_aura::AuraApi<Block, AuraId> for Runtime {
 				fn slot_duration() -> u64 { 1 }
+				fn authorities() -> Vec<AuraId> { system::authorities() }
+			}
+
+			impl consensus_babe::BabeApi<Block> for Runtime {
+				fn startup_data() -> consensus_babe::BabeConfiguration {
+					consensus_babe::BabeConfiguration {
+						slot_duration: 1,
+						expected_block_time: 1,
+						threshold: std::u64::MAX,
+						median_required_blocks: 100,
+					}
+				}
+				fn authorities() -> Vec<BabeId> { system::authorities() }
 			}
 
 			impl offchain_primitives::OffchainWorkerApi<Block> for Runtime {
 				fn offchain_worker(block: u64) {
 					let ex = Extrinsic::IncludeData(block.encode());
-					runtime_io::submit_extrinsic(&ex)
-				}
-			}
-
-			impl consensus_authorities::AuthoritiesApi<Block> for Runtime {
-				fn authorities() -> Vec<AuthorityIdFor<Block>> {
-					crate::system::authorities()
+					runtime_io::submit_transaction(&ex).unwrap();
 				}
 			}
 		}
@@ -450,10 +501,6 @@ cfg_if! {
 				fn initialize_block(header: &<Block as BlockT>::Header) {
 					system::initialize_block(header)
 				}
-
-				fn authorities() -> Vec<AuthorityId> {
-					panic!("Deprecated, please use `AuthoritiesApi`.")
-				}
 			}
 
 			impl client_api::Metadata<Block> for Runtime {
@@ -464,6 +511,16 @@ cfg_if! {
 
 			impl client_api::TaggedTransactionQueue<Block> for Runtime {
 				fn validate_transaction(utx: <Block as BlockT>::Extrinsic) -> TransactionValidity {
+					if let Extrinsic::IncludeData(data) = utx {
+						return TransactionValidity::Valid {
+							priority: data.len() as u64,
+							requires: vec![],
+							provides: vec![data],
+							longevity: 1,
+							propagate: false,
+						};
+					}
+
 					system::validate_transaction(utx)
 				}
 			}
@@ -537,24 +594,41 @@ cfg_if! {
 				fn benchmark_direct_call() -> u64 {
 					(0..10000).fold(0, |p, i| p + benchmark_add_one(i))
 				}
+
+				fn get_block_number() -> u64 {
+					system::get_block_number().expect("Block number is initialized")
+				}
+
+				fn without_initialize_block() -> bool {
+					system::get_block_number().is_none()
+				}
+
+				fn take_block_number() -> Option<u64> {
+					system::take_block_number()
+				}
 			}
 
-
-
-			impl consensus_aura::AuraApi<Block> for Runtime {
+			impl consensus_aura::AuraApi<Block, AuraId> for Runtime {
 				fn slot_duration() -> u64 { 1 }
+				fn authorities() -> Vec<AuraId> { system::authorities() }
+			}
+
+			impl consensus_babe::BabeApi<Block> for Runtime {
+				fn startup_data() -> consensus_babe::BabeConfiguration {
+					consensus_babe::BabeConfiguration {
+						median_required_blocks: 0,
+						slot_duration: 1,
+						expected_block_time: 1,
+						threshold: core::u64::MAX,
+					}
+				}
+				fn authorities() -> Vec<BabeId> { system::authorities() }
 			}
 
 			impl offchain_primitives::OffchainWorkerApi<Block> for Runtime {
 				fn offchain_worker(block: u64) {
 					let ex = Extrinsic::IncludeData(block.encode());
-					runtime_io::submit_extrinsic(&ex)
-				}
-			}
-
-			impl consensus_authorities::AuthoritiesApi<Block> for Runtime {
-				fn authorities() -> Vec<AuthorityIdFor<Block>> {
-					crate::system::authorities()
+					runtime_io::submit_transaction(&ex).unwrap()
 				}
 			}
 		}

@@ -19,8 +19,8 @@
 //! The offchain workers is a special function of the runtime that
 //! gets executed after block is imported. During execution
 //! it's able to asynchronously submit extrinsics that will either
-//! be propagated to other nodes (transactions) or will be
-//! added to the next block produced by the node as inherents.
+//! be propagated to other nodes added to the next block
+//! produced by the node as unsigned transactions.
 //!
 //! Offchain workers can be used for computation-heavy tasks
 //! that are not feasible for execution during regular block processing.
@@ -34,75 +34,86 @@
 #![warn(missing_docs)]
 
 use std::{
+	fmt,
 	marker::PhantomData,
 	sync::Arc,
 };
 
 use client::runtime_api::ApiExt;
-use inherents::pool::InherentsPool;
 use log::{debug, warn};
 use primitives::ExecutionContext;
 use runtime_primitives::{
 	generic::BlockId,
 	traits::{self, ProvideRuntimeApi},
 };
-use tokio::runtime::TaskExecutor;
+use futures::future::Future;
 use transaction_pool::txpool::{Pool, ChainApi};
 
 mod api;
 
+pub mod testing;
+
 pub use offchain_primitives::OffchainWorkerApi;
 
 /// An offchain workers manager.
-#[derive(Debug)]
-pub struct OffchainWorkers<C, Block: traits::Block> {
+pub struct OffchainWorkers<C, S, Block: traits::Block> {
 	client: Arc<C>,
-	inherents_pool: Arc<InherentsPool<<Block as traits::Block>::Extrinsic>>,
-	executor: TaskExecutor,
+	db: S,
 	_block: PhantomData<Block>,
 }
 
-impl<C, Block: traits::Block> OffchainWorkers<C, Block> {
+impl<C, S, Block: traits::Block> OffchainWorkers<C, S, Block> {
 	/// Creates new `OffchainWorkers`.
 	pub fn new(
 		client: Arc<C>,
-		inherents_pool: Arc<InherentsPool<<Block as traits::Block>::Extrinsic>>,
-		executor: TaskExecutor,
+		db: S,
 	) -> Self {
 		Self {
 			client,
-			inherents_pool,
-			executor,
+			db,
 			_block: PhantomData,
 		}
 	}
 }
 
-impl<C, Block> OffchainWorkers<C, Block> where
+impl<C, S, Block: traits::Block> fmt::Debug for OffchainWorkers<C, S, Block> {
+	fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+		f.debug_tuple("OffchainWorkers").finish()
+	}
+}
+
+impl<C, S, Block> OffchainWorkers<C, S, Block> where
 	Block: traits::Block,
+	S: client::backend::OffchainStorage + 'static,
 	C: ProvideRuntimeApi,
 	C::Api: OffchainWorkerApi<Block>,
 {
 	/// Start the offchain workers after given block.
+	#[must_use]
 	pub fn on_block_imported<A>(
 		&self,
 		number: &<Block::Header as traits::Header>::Number,
 		pool: &Arc<Pool<A>>,
-	) where
+	) -> impl Future<Item = (), Error = ()> where
 		A: ChainApi<Block=Block> + 'static,
 	{
 		let runtime = self.client.runtime_api();
 		let at = BlockId::number(*number);
-		let has_api = runtime.has_api::<OffchainWorkerApi<Block>>(&at);
+		let has_api = runtime.has_api::<dyn OffchainWorkerApi<Block>>(&at);
 		debug!("Checking offchain workers at {:?}: {:?}", at, has_api);
 
 		if has_api.unwrap_or(false) {
-			let (api, runner) = api::Api::new(pool.clone(), self.inherents_pool.clone(), at.clone());
-			self.executor.spawn(runner.process());
-
+			let (api, runner) = api::AsyncApi::new(
+				pool.clone(),
+				self.db.clone(),
+				at.clone(),
+			);
 			debug!("Running offchain workers at {:?}", at);
 			let api = Box::new(api);
 			runtime.offchain_worker_with_context(&at, ExecutionContext::OffchainWorker(api), *number).unwrap();
+			futures::future::Either::A(runner.process())
+		} else {
+			futures::future::Either::B(futures::future::ok(()))
 		}
 	}
 }
@@ -119,14 +130,15 @@ mod tests {
 		let runtime = tokio::runtime::Runtime::new().unwrap();
 		let client = Arc::new(test_client::new());
 		let pool = Arc::new(Pool::new(Default::default(), ::transaction_pool::ChainApi::new(client.clone())));
-		let inherents = Arc::new(InherentsPool::default());
+		let db = client_db::offchain::LocalStorage::new_test();
 
 		// when
-		let offchain = OffchainWorkers::new(client, inherents.clone(), runtime.executor());
-		offchain.on_block_imported(&0u64, &pool);
+		let offchain = OffchainWorkers::new(client, db);
+		runtime.executor().spawn(offchain.on_block_imported(&0u64, &pool));
 
 		// then
 		runtime.shutdown_on_idle().wait().unwrap();
-		assert_eq!(inherents.drain().len(), 1);
+		assert_eq!(pool.status().ready, 1);
+		assert_eq!(pool.ready().next().unwrap().is_propagateable(), false);
 	}
 }
