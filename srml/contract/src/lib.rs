@@ -96,7 +96,7 @@ use crate::exec::ExecutionContext;
 use crate::account_db::{AccountDb, DirectAccountDb};
 
 #[cfg(feature = "std")]
-use serde_derive::{Serialize, Deserialize};
+use serde::{Serialize, Deserialize};
 use substrate_primitives::crypto::UncheckedFrom;
 use rstd::prelude::*;
 use rstd::marker::PhantomData;
@@ -106,6 +106,7 @@ use srml_support::dispatch::{Result, Dispatchable};
 use srml_support::{Parameter, StorageMap, StorageValue, decl_module, decl_event, decl_storage, storage::child};
 use srml_support::traits::{OnFreeBalanceZero, OnUnbalanced, Currency};
 use system::{ensure_signed, RawOrigin};
+use substrate_primitives::storage::well_known_keys::CHILD_STORAGE_KEY_PREFIX;
 use timestamp;
 
 pub type CodeHash<T> = <T as system::Trait>::Hash;
@@ -135,10 +136,15 @@ pub struct AccountInfo {
 /// Note that it is different than encode because trie id should have collision resistance
 /// property (being a proper uniqueid).
 pub trait TrieIdGenerator<AccountId> {
-	/// get a trie id for an account, using reference to parent account trie id to ensure
-	/// uniqueness of trie id
-	/// The implementation must ensure every new trie id is unique: two consecutive call with the
+	/// Get a trie id for an account, using reference to parent account trie id to ensure
+	/// uniqueness of trie id.
+	///
+	/// The implementation must ensure every new trie id is unique: two consecutive calls with the
 	/// same parameter needs to return different trie id values.
+	///
+	/// Also, the implementation is responsible for ensuring that `TrieId` starts with
+	/// `:child_storage:`.
+	/// TODO: We want to change this, see https://github.com/paritytech/substrate/issues/2325
 	fn trie_id(account_id: &AccountId) -> TrieId;
 }
 
@@ -159,7 +165,13 @@ where
 		let mut buf = Vec::new();
 		buf.extend_from_slice(account_id.as_ref());
 		buf.extend_from_slice(&new_seed.to_le_bytes()[..]);
-		T::Hashing::hash(&buf[..]).as_ref().into()
+
+		// TODO: see https://github.com/paritytech/substrate/issues/2325
+		CHILD_STORAGE_KEY_PREFIX.iter()
+			.chain(b"default:")
+			.chain(T::Hashing::hash(&buf[..]).as_ref().iter())
+			.cloned()
+			.collect()
 	}
 }
 
@@ -237,7 +249,7 @@ decl_module! {
 		/// Updates the schedule for metering contracts.
 		///
 		/// The schedule must have a greater version than the stored schedule.
-		fn update_schedule(schedule: Schedule<T::Gas>) -> Result {
+		pub fn update_schedule(schedule: Schedule<T::Gas>) -> Result {
 			if <Module<T>>::current_schedule().version >= schedule.version {
 				return Err("new schedule must have a greater version than current");
 			}
@@ -250,7 +262,7 @@ decl_module! {
 
 		/// Stores the given binary Wasm code into the chains storage and returns its `codehash`.
 		/// You can instantiate contracts only with stored code.
-		fn put_code(
+		pub fn put_code(
 			origin,
 			#[compact] gas_limit: T::Gas,
 			code: Vec<u8>
@@ -277,7 +289,7 @@ decl_module! {
 		/// * If the account is a regular account, any value will be transferred.
 		/// * If no account exists and the call value is not less than `existential_deposit`,
 		/// a regular account will be created and any value will be transferred.
-		fn call(
+		pub fn call(
 			origin,
 			dest: <T::Lookup as StaticLookup>::Source,
 			#[compact] value: BalanceOf<T>,
@@ -333,7 +345,7 @@ decl_module! {
 		///   after the execution is saved as the `code` of the account. That code will be invoked
 		///   upon any call received by this account.
 		/// - The contract is initialized.
-		fn create(
+		pub fn create(
 			origin,
 			#[compact] endowment: BalanceOf<T>,
 			#[compact] gas_limit: T::Gas,
@@ -432,7 +444,7 @@ decl_storage! {
 		/// The maximum nesting level of a call/create stack.
 		MaxDepth get(max_depth) config(): u32 = 100;
 		/// The maximum amount of gas that could be expended per block.
-		BlockGasLimit get(block_gas_limit) config(): T::Gas = T::Gas::sa(1_000_000);
+		BlockGasLimit get(block_gas_limit) config(): T::Gas = T::Gas::sa(10_000_000);
 		/// Gas spent so far in this block.
 		GasSpent get(gas_spent): T::Gas;
 		/// Current cost schedule for contracts.

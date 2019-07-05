@@ -18,13 +18,13 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::{io, thread};
-use log::{warn, debug, error, trace, info};
+use log::{warn, debug, error, trace};
 use futures::{Async, Future, Stream, stream, sync::oneshot, sync::mpsc};
 use parking_lot::{Mutex, RwLock};
 use network_libp2p::{ProtocolId, NetworkConfiguration, Severity};
 use network_libp2p::{start_service, parse_str_addr, Service as NetworkService, ServiceEvent as NetworkServiceEvent};
-use network_libp2p::{multiaddr, RegisteredProtocol, NetworkState};
-use peerset::Peerset;
+use network_libp2p::{RegisteredProtocol, NetworkState};
+use peerset::PeersetHandle;
 use consensus::import_queue::{ImportQueue, Link};
 use crate::consensus_gossip::ConsensusGossip;
 use crate::message::Message;
@@ -141,7 +141,7 @@ pub struct Service<B: BlockT + 'static, S: NetworkSpecialization<B>> {
 	network: Arc<Mutex<NetworkService<Message<B>>>>,
 	/// Peerset manager (PSM); manages the reputation of nodes and indicates the network which
 	/// nodes it should be connected to or not.
-	peerset: Arc<Peerset>,
+	peerset: PeersetHandle,
 	/// Protocol sender
 	protocol_sender: Sender<ProtocolMsg<B, S>>,
 	/// Sender for messages to the background service task, and handle for the background thread.
@@ -344,8 +344,6 @@ pub trait ManageNetwork {
 	fn remove_reserved_peer(&self, peer: PeerId);
 	/// Add reserved peer
 	fn add_reserved_peer(&self, peer: String) -> Result<(), String>;
-	/// Returns a user-friendly identifier of our node.
-	fn node_id(&self) -> Option<String>;
 }
 
 impl<B: BlockT + 'static, S: NetworkSpecialization<B>> ManageNetwork for Service<B, S> {
@@ -358,7 +356,7 @@ impl<B: BlockT + 'static, S: NetworkSpecialization<B>> ManageNetwork for Service
 	}
 
 	fn remove_reserved_peer(&self, peer: PeerId) {
-		self.peerset.remove_reserved_peer(&peer);
+		self.peerset.remove_reserved_peer(peer);
 	}
 
 	fn add_reserved_peer(&self, peer: String) -> Result<(), String> {
@@ -366,19 +364,6 @@ impl<B: BlockT + 'static, S: NetworkSpecialization<B>> ManageNetwork for Service
 		self.peerset.add_reserved_peer(peer_id.clone());
 		self.network.lock().add_known_address(peer_id, addr);
 		Ok(())
-	}
-
-	fn node_id(&self) -> Option<String> {
-		let network = self.network.lock();
-		let ret = network
-			.listeners()
-			.next()
-			.map(|addr| {
-				let mut addr = addr.clone();
-				addr.append(multiaddr::Protocol::P2p(network.peer_id().clone().into()));
-				addr.to_string()
-			});
-		ret
 	}
 }
 
@@ -464,6 +449,9 @@ pub enum NetworkMsg<B: BlockT + 'static> {
 	Outgoing(PeerId, Message<B>),
 	/// Report a peer.
 	ReportPeer(PeerId, Severity),
+	/// Synchronization response.
+	#[cfg(any(test, feature = "test-helpers"))]
+	Synchronized,
 }
 
 /// Starts the background thread that handles the networking.
@@ -472,7 +460,7 @@ fn start_thread<B: BlockT + 'static>(
 	network_port: NetworkPort<B>,
 	config: NetworkConfiguration,
 	registered: RegisteredProtocol<Message<B>>,
-) -> Result<((oneshot::Sender<()>, thread::JoinHandle<()>), Arc<Mutex<NetworkService<Message<B>>>>, Arc<Peerset>), Error> {
+) -> Result<((oneshot::Sender<()>, thread::JoinHandle<()>), Arc<Mutex<NetworkService<Message<B>>>>, PeersetHandle), Error> {
 	// Start the main service.
 	let (service, peerset) = match start_service(config, registered) {
 		Ok((service, peerset)) => (Arc::new(Mutex::new(service)), peerset),
@@ -485,8 +473,9 @@ fn start_thread<B: BlockT + 'static>(
 	let (close_tx, close_rx) = oneshot::channel();
 	let service_clone = service.clone();
 	let mut runtime = RuntimeBuilder::new().name_prefix("libp2p-").build()?;
+	let peerset_clone = peerset.clone();
 	let thread = thread::Builder::new().name("network".to_string()).spawn(move || {
-		let fut = run_thread(protocol_sender, service_clone, network_port)
+		let fut = run_thread(protocol_sender, service_clone, network_port, peerset_clone)
 			.select(close_rx.then(|_| Ok(())))
 			.map(|(val, _)| val)
 			.map_err(|(err,_ )| err);
@@ -507,6 +496,7 @@ fn run_thread<B: BlockT + 'static>(
 	protocol_sender: Sender<FromNetworkMsg<B>>,
 	network_service: Arc<Mutex<NetworkService<Message<B>>>>,
 	network_port: NetworkPort<B>,
+	peerset: PeersetHandle,
 ) -> impl Future<Item = (), Error = io::Error> {
 
 	let network_service_2 = network_service.clone();
@@ -529,10 +519,10 @@ fn run_thread<B: BlockT + 'static>(
 			NetworkMsg::ReportPeer(who, severity) => {
 				match severity {
 					Severity::Bad(message) => {
-						info!(target: "sync", "Banning {:?} because {:?}", who, message);
-						warn!(target: "sync", "Banning a node is a deprecated mechanism that \
-							should be removed");
-						network_service_2.lock().drop_node(&who)
+						debug!(target: "sync", "Banning {:?} because {:?}", who, message);
+						network_service_2.lock().drop_node(&who);
+						// temporary: make sure the peer gets dropped from the peerset
+						peerset.report_peer(who, i32::min_value());
 					},
 					Severity::Useless(message) => {
 						debug!(target: "sync", "Dropping {:?} because {:?}", who, message);
@@ -544,6 +534,8 @@ fn run_thread<B: BlockT + 'static>(
 					},
 				}
 			},
+			#[cfg(any(test, feature = "test-helpers"))]
+			NetworkMsg::Synchronized => (),
 		}
 		Ok(())
 	})
