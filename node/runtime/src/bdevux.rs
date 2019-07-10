@@ -8,12 +8,12 @@
 /// For more guidance on Substrate modules, see the example module
 /// https://github.com/paritytech/substrate/blob/master/srml/example/src/lib.rs
 
-use parity_codec::Encode;
+// use parity_codec::Encode;
+use parity_codec::{Encode, Decode};
 use support::{decl_storage, decl_module, StorageValue, StorageMap,
     dispatch::Result, ensure, decl_event};
 use system::ensure_signed;
 use runtime_primitives::traits::{Hash};
-use parity_codec_derive;//::{Encode, Decode};
 
 use rstd::prelude::*;
 
@@ -25,12 +25,15 @@ pub trait Trait: system::Trait {
 	type Event: From<Event<Self>> + Into<<Self as system::Trait>::Event>;
 }
 
-#[derive(parity_codec_derive::Encode, parity_codec_derive::Decode, Default, Clone, PartialEq)]
+#[derive(PartialEq, Eq, Clone, Encode, Decode)]
+#[cfg_attr(feature = "std", derive(Debug))]
+#[derive(Default)]
 pub struct Asset<Hash> {
 	id: Hash,
 	name: Vec<u8>,
 	open: bool,
 }
+
 
 /// This module's storage items.
 decl_storage! {
