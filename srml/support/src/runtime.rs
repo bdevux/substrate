@@ -194,10 +194,10 @@ macro_rules! construct_runtime {
 		#[derive(Clone, Copy, PartialEq, Eq)]
 		#[cfg_attr(feature = "std", derive(Debug))]
 		pub struct $runtime;
-		impl $crate::runtime_primitives::traits::GetNodeBlockType for $runtime {
+		impl $crate::sr_primitives::traits::GetNodeBlockType for $runtime {
 			type NodeBlock = $node_block;
 		}
-		impl $crate::runtime_primitives::traits::GetRuntimeBlockType for $runtime {
+		impl $crate::sr_primitives::traits::GetRuntimeBlockType for $runtime {
 			type RuntimeBlock = $block;
 		}
 		$crate::__decl_outer_event!(
@@ -299,6 +299,7 @@ macro_rules! __create_decl_macro {
 					)*
 				);
 			};
+			// Parse system module
 			(@inner
 				$runtime:ident;
 				; // there can not be multiple `System`s
@@ -315,6 +316,7 @@ macro_rules! __create_decl_macro {
 					$d( $rest )*
 				);
 			};
+			// Parse instantiable module with generic
 			(@inner
 				$runtime:ident;
 				$d( $system:ident )?;
@@ -334,6 +336,23 @@ macro_rules! __create_decl_macro {
 					$d( $rest )*
 				);
 			};
+			// Parse instantiable module with no generic
+			(@inner
+				$runtime:ident;
+				$d( $system:ident )?;
+				{ $d( $parsed:tt )* };
+				$name:ident : $module:ident:: < $module_instance:ident >:: {
+					$macro_enum_name $d(, $ingore:ident $d( <$ignor:ident> )* )*
+				},
+				$d( $rest:tt )*
+			) => {
+				compile_error!(concat!(
+					"Instantiable module with not generic ", stringify!($macro_enum_name),
+					" cannot be constructed: module `", stringify!($name), "` must have generic ",
+					stringify!($macro_enum_name), "."
+				));
+			};
+			// Parse instantiable module with no generic
 			(@inner
 				$runtime:ident;
 				$d( $system:ident )?;
@@ -353,6 +372,7 @@ macro_rules! __create_decl_macro {
 					$d( $rest )*
 				);
 			};
+			// Ignore keyword
 			(@inner
 				$runtime:ident;
 				$d( $system:ident )?;
@@ -370,6 +390,7 @@ macro_rules! __create_decl_macro {
 					$d( $rest )*
 				);
 			};
+			// Ignore module
 			(@inner
 				$runtime:ident;
 				$d( $system:ident )?;
@@ -384,6 +405,7 @@ macro_rules! __create_decl_macro {
 					$d( $rest )*
 				);
 			};
+			// Expand
 			(@inner
 				$runtime:ident;
 				$system:ident;
@@ -576,7 +598,9 @@ macro_rules! __decl_runtime_metadata {
 			$runtime;
 			{
 				$( $parsed )*
-				$module $( < $module_instance > )?  { $( $( $leading_module )* )? $( $modules )* }
+				$module $( < $module_instance > )? as $name {
+					$( $( $leading_module )* )? $( $modules )*
+				}
 			};
 			$( $rest )*
 		);
@@ -618,11 +642,18 @@ macro_rules! __decl_runtime_metadata {
 	// end of decl
 	(
 		$runtime:ident;
-		{ $( $parsed_modules:ident $( < $module_instance:ident > )? { $( $withs:ident )* } )* };
+		{
+			$(
+				$parsed_modules:ident $( < $module_instance:ident > )? as $parsed_name:ident {
+					$( $withs:ident )*
+				}
+			)*
+		};
 	) => {
 		$crate::impl_runtime_metadata!(
 			for $runtime with modules
-				$( $parsed_modules::Module $( < $module_instance > )? with $( $withs )* , )*
+				$( $parsed_modules::Module $( < $module_instance > )? as $parsed_name
+					with $( $withs )* , )*
 		);
 	}
 }
@@ -689,7 +720,7 @@ macro_rules! __decl_outer_config {
 		};
 	) => {
 		$crate::paste::item! {
-			$crate::runtime_primitives::impl_outer_config!(
+			$crate::sr_primitives::impl_outer_config!(
 				pub struct GenesisConfig for $runtime {
 					$(
 						[< $parsed_name Config >] =>

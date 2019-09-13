@@ -18,13 +18,13 @@
 
 use std::{cell::RefCell, rc::Rc};
 use log::debug;
-use hash_db::Hasher;
-use hash_db::HashDB;
+use hash_db::{Hasher, HashDB, EMPTY_PREFIX};
 use trie::{
-	MemoryDB, PrefixedMemoryDB, TrieError, default_child_trie_root,
+	MemoryDB, PrefixedMemoryDB, default_child_trie_root,
 	read_trie_value_with, read_child_trie_value_with, record_all_keys
 };
 pub use trie::Recorder;
+pub use trie::trie_types::{Layout, TrieError};
 use crate::trie_backend::TrieBackend;
 use crate::trie_backend_essence::{Ephemeral, TrieBackendEssence, TrieBackendStorage};
 use crate::{Error, ExecutionError, Backend};
@@ -50,11 +50,21 @@ impl<'a, S, H> ProvingBackendEssence<'a, S, H>
 
 		let map_e = |e| format!("Trie lookup error: {}", e);
 
-		read_trie_value_with::<H, _, Ephemeral<S, H>>(&eph, self.backend.root(), key, &mut *self.proof_recorder).map_err(map_e)
+		read_trie_value_with::<Layout<H>, _, Ephemeral<S, H>>(
+			&eph,
+			self.backend.root(),
+			key,
+			&mut *self.proof_recorder
+		).map_err(map_e)
 	}
 
-	pub fn child_storage(&mut self, storage_key: &[u8], key: &[u8]) -> Result<Option<Vec<u8>>, String> {
-		let root = self.storage(storage_key)?.unwrap_or(default_child_trie_root::<H>(storage_key));
+	pub fn child_storage(
+		&mut self,
+		storage_key: &[u8],
+		key: &[u8]
+	) -> Result<Option<Vec<u8>>, String> {
+		let root = self.storage(storage_key)?
+			.unwrap_or(default_child_trie_root::<Layout<H>>(storage_key));
 
 		let mut read_overlay = S::Overlay::default();
 		let eph = Ephemeral::new(
@@ -64,7 +74,13 @@ impl<'a, S, H> ProvingBackendEssence<'a, S, H>
 
 		let map_e = |e| format!("Trie lookup error: {}", e);
 
-		read_child_trie_value_with(storage_key, &eph, &root, key, &mut *self.proof_recorder).map_err(map_e)
+		read_child_trie_value_with::<Layout<H>, _, _>(
+			storage_key,
+			&eph,
+			&root,
+			key,
+			&mut *self.proof_recorder
+		).map_err(map_e)
 	}
 
 	pub fn record_all_keys(&mut self) {
@@ -76,7 +92,7 @@ impl<'a, S, H> ProvingBackendEssence<'a, S, H>
 
 		let mut iter = move || -> Result<(), Box<TrieError<H::Out>>> {
 			let root = self.backend.root();
-			record_all_keys::<H, _>(&eph, root, &mut *self.proof_recorder)
+			record_all_keys::<Layout<H>, _>(&eph, root, &mut *self.proof_recorder)
 		};
 
 		if let Err(e) = iter() {
@@ -112,9 +128,8 @@ impl<'a, S: 'a + TrieBackendStorage<H>, H: 'a + Hasher> ProvingBackend<'a, S, H>
 		}
 	}
 
-	/// Consume the backend, extracting the gathered proof in lexicographical order
-	/// by value.
-	pub fn extract_proof(self) -> Vec<Vec<u8>> {
+	/// Consume the backend, extracting the gathered proof in lexicographical order by value.
+	pub fn extract_proof(&self) -> Vec<Vec<u8>> {
 		self.proof_recorder
 			.borrow_mut()
 			.drain()
@@ -158,6 +173,14 @@ impl<'a, S, H> Backend<H> for ProvingBackend<'a, S, H>
 		self.backend.for_keys_with_prefix(prefix, f)
 	}
 
+	fn for_key_values_with_prefix<F: FnMut(&[u8], &[u8])>(&self, prefix: &[u8], f: F) {
+		self.backend.for_key_values_with_prefix(prefix, f)
+	}
+
+	fn for_child_keys_with_prefix<F: FnMut(&[u8])>(&self, storage_key: &[u8], prefix: &[u8], f: F) {
+		self.backend.for_child_keys_with_prefix(storage_key, prefix, f)
+	}
+
 	fn pairs(&self) -> Vec<(Vec<u8>, Vec<u8>)> {
 		self.backend.pairs()
 	}
@@ -183,10 +206,6 @@ impl<'a, S, H> Backend<H> for ProvingBackend<'a, S, H>
 	{
 		self.backend.child_storage_root(storage_key, delta)
 	}
-
-	fn as_trie_backend(&mut self) -> Option<&TrieBackend<Self::TrieBackendStorage, H>> {
-		None
-	}
 }
 
 /// Create proof check backend.
@@ -199,7 +218,7 @@ where
 {
 	let db = create_proof_check_backend_storage(proof);
 
-	if db.contains(&root, &[]) {
+	if db.contains(&root, EMPTY_PREFIX) {
 		Ok(TrieBackend::new(db, root))
 	} else {
 		Err(Box::new(ExecutionError::InvalidProof))
@@ -215,7 +234,7 @@ where
 {
 	let mut db = MemoryDB::default();
 	for item in proof {
-		db.insert(&[], &item);
+		db.insert(EMPTY_PREFIX, &item);
 	}
 	db
 }
@@ -225,8 +244,7 @@ mod tests {
 	use crate::backend::{InMemory};
 	use crate::trie_backend::tests::test_trie;
 	use super::*;
-	use primitives::{Blake2Hasher};
-	use crate::ChildStorageKey;
+	use primitives::{Blake2Hasher, child_storage_key::ChildStorageKey};
 
 	fn test_proving<'a>(
 		trie_backend: &'a TrieBackend<PrefixedMemoryDB<Blake2Hasher>,Blake2Hasher>,
@@ -291,12 +309,8 @@ mod tests {
 
 	#[test]
 	fn proof_recorded_and_checked_with_child() {
-		let subtrie1 = ChildStorageKey::<Blake2Hasher>::from_slice(
-			b":child_storage:default:sub1"
-		).unwrap();
-		let subtrie2 = ChildStorageKey::<Blake2Hasher>::from_slice(
-			b":child_storage:default:sub2"
-		).unwrap();
+		let subtrie1 = ChildStorageKey::from_slice(b":child_storage:default:sub1").unwrap();
+		let subtrie2 = ChildStorageKey::from_slice(b":child_storage:default:sub2").unwrap();
 		let own1 = subtrie1.into_owned();
 		let own2 = subtrie2.into_owned();
 		let contents = (0..64).map(|i| (None, vec![i], Some(vec![i])))
@@ -307,7 +321,7 @@ mod tests {
 		let mut in_memory = in_memory.update(contents);
 		let in_memory_root = in_memory.full_storage_root::<_, Vec<_>, _>(
 			::std::iter::empty(),
-      in_memory.child_storage_keys().map(|k|(k.to_vec(), Vec::new()))
+			in_memory.child_storage_keys().map(|k|(k.to_vec(), Vec::new()))
 		).0;
 		(0..64).for_each(|i| assert_eq!(
 			in_memory.storage(&[i]).unwrap().unwrap(),

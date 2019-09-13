@@ -70,16 +70,17 @@
 #[cfg(feature = "std")]
 use serde::{Serialize, Deserialize};
 use rstd::prelude::*;
-use srml_support::{StorageValue, StorageMap, decl_module, decl_storage, decl_event, ensure, print};
-use srml_support::traits::{
+use support::{StorageValue, StorageMap, decl_module, decl_storage, decl_event, ensure, print};
+use support::traits::{
 	Currency, ExistenceRequirement, Get, Imbalance, OnDilution, OnUnbalanced,
 	ReservableCurrency, WithdrawReason
 };
-use runtime_primitives::{Permill, ModuleId};
-use runtime_primitives::traits::{
+use sr_primitives::{Permill, ModuleId};
+use sr_primitives::traits::{
 	Zero, EnsureOrigin, StaticLookup, CheckedSub, CheckedMul, AccountIdConversion
 };
-use parity_codec::{Encode, Decode};
+use sr_primitives::weights::SimpleDispatchInfo;
+use codec::{Encode, Decode};
 use system::ensure_signed;
 
 type BalanceOf<T> = <<T as Trait>::Currency as Currency<<T as system::Trait>::AccountId>>::Balance;
@@ -87,11 +88,6 @@ type PositiveImbalanceOf<T> = <<T as Trait>::Currency as Currency<<T as system::
 type NegativeImbalanceOf<T> = <<T as Trait>::Currency as Currency<<T as system::Trait>::AccountId>>::NegativeImbalance;
 
 const MODULE_ID: ModuleId = ModuleId(*b"py/trsry");
-
-pub const DEFAULT_PROPOSAL_BOND: u32 = 0;
-pub const DEFAULT_PROPOSAL_BOND_MINIMUM: u32 = 0;
-pub const DEFAULT_SPEND_PERIOD: u32 = 0;
-pub const DEFAULT_BURN: u32 = 0;
 
 pub trait Trait: system::Trait {
 	/// The staking balance.
@@ -143,7 +139,7 @@ decl_module! {
 		/// Percentage of spare funds (if any) that are burnt per spend period.
 		const Burn: Permill = T::Burn::get();
 
-		fn deposit_event<T>() = default;
+		fn deposit_event() = default;
 		/// Put forward a suggestion for spending. A deposit proportional to the value
 		/// is reserved and slashed if the proposal is rejected. It is returned once the
 		/// proposal is awarded.
@@ -153,6 +149,7 @@ decl_module! {
 		/// - Limited storage reads.
 		/// - One DB change, one extra DB entry.
 		/// # </weight>
+		#[weight = SimpleDispatchInfo::FixedNormal(500_000)]
 		fn propose_spend(
 			origin,
 			#[compact] value: BalanceOf<T>,
@@ -179,6 +176,7 @@ decl_module! {
 		/// - Limited storage reads.
 		/// - One DB clear.
 		/// # </weight>
+		#[weight = SimpleDispatchInfo::FixedOperational(100_000)]
 		fn reject_proposal(origin, #[compact] proposal_id: ProposalIndex) {
 			T::RejectOrigin::ensure_origin(origin)?;
 			let proposal = <Proposals<T>>::take(proposal_id).ok_or("No proposal at that index")?;
@@ -196,6 +194,7 @@ decl_module! {
 		/// - Limited storage reads.
 		/// - One DB change.
 		/// # </weight>
+		#[weight = SimpleDispatchInfo::FixedOperational(100_000)]
 		fn approve_proposal(origin, #[compact] proposal_id: ProposalIndex) {
 			T::ApproveOrigin::ensure_origin(origin)?;
 
@@ -358,9 +357,9 @@ mod tests {
 	use super::*;
 
 	use runtime_io::with_externalities;
-	use srml_support::{assert_noop, assert_ok, impl_outer_origin, parameter_types};
-	use substrate_primitives::{H256, Blake2Hasher};
-	use runtime_primitives::{traits::{BlakeTwo256, OnFinalize, IdentityLookup}, testing::Header};
+	use support::{assert_noop, assert_ok, impl_outer_origin, parameter_types};
+	use primitives::{H256, Blake2Hasher};
+	use sr_primitives::{Perbill, traits::{BlakeTwo256, OnFinalize, IdentityLookup}, testing::Header};
 
 	impl_outer_origin! {
 		pub enum Origin for Test {}
@@ -368,16 +367,29 @@ mod tests {
 
 	#[derive(Clone, Eq, PartialEq)]
 	pub struct Test;
+	parameter_types! {
+		pub const BlockHashCount: u64 = 250;
+		pub const MaximumBlockWeight: u32 = 1024;
+		pub const MaximumBlockLength: u32 = 2 * 1024;
+		pub const AvailableBlockRatio: Perbill = Perbill::one();
+	}
 	impl system::Trait for Test {
 		type Origin = Origin;
 		type Index = u64;
 		type BlockNumber = u64;
+		type Call = ();
 		type Hash = H256;
 		type Hashing = BlakeTwo256;
 		type AccountId = u64;
 		type Lookup = IdentityLookup<Self::AccountId>;
 		type Header = Header;
+		type WeightMultiplierUpdate = ();
 		type Event = ();
+		type BlockHashCount = BlockHashCount;
+		type MaximumBlockWeight = MaximumBlockWeight;
+		type AvailableBlockRatio = AvailableBlockRatio;
+		type MaximumBlockLength = MaximumBlockLength;
+		type Version = ();
 	}
 	parameter_types! {
 		pub const ExistentialDeposit: u64 = 0;
@@ -399,6 +411,7 @@ mod tests {
 		type CreationFee = CreationFee;
 		type TransactionBaseFee = TransactionBaseFee;
 		type TransactionByteFee = TransactionByteFee;
+		type WeightToFee = ();
 	}
 	parameter_types! {
 		pub const ProposalBond: Permill = Permill::from_percent(5);
@@ -422,11 +435,11 @@ mod tests {
 	type Treasury = Module<Test>;
 
 	fn new_test_ext() -> runtime_io::TestExternalities<Blake2Hasher> {
-		let mut t = system::GenesisConfig::default().build_storage::<Test>().unwrap().0;
-		t.extend(balances::GenesisConfig::<Test>{
+		let mut t = system::GenesisConfig::default().build_storage::<Test>().unwrap();
+		balances::GenesisConfig::<Test>{
 			balances: vec![(0, 100), (1, 99), (2, 1)],
 			vesting: vec![],
-		}.build_storage().unwrap().0);
+		}.assimilate_storage(&mut t).unwrap();
 		t.into()
 	}
 
@@ -489,10 +502,13 @@ mod tests {
 	#[test]
 	fn unused_pot_should_diminish() {
 		with_externalities(&mut new_test_ext(), || {
+			let init_total_issuance = Balances::total_issuance();
 			Treasury::on_dilution(100, 100);
+			assert_eq!(Balances::total_issuance(), init_total_issuance + 100);
 
 			<Treasury as OnFinalize<u64>>::on_finalize(2);
 			assert_eq!(Treasury::pot(), 50);
+			assert_eq!(Balances::total_issuance(), init_total_issuance + 50);
 		});
 	}
 

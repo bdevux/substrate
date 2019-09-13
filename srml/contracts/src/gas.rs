@@ -16,10 +16,12 @@
 
 use crate::{GasSpent, Module, Trait, BalanceOf, NegativeImbalanceOf};
 use rstd::convert::TryFrom;
-use runtime_primitives::BLOCK_FULL;
-use runtime_primitives::traits::{CheckedMul, Zero, SaturatedConversion, SimpleArithmetic, UniqueSaturatedInto};
-use srml_support::StorageValue;
-use srml_support::traits::{Currency, ExistenceRequirement, Get, Imbalance, OnUnbalanced, WithdrawReason};
+use sr_primitives::traits::{
+	CheckedMul, Zero, SaturatedConversion, SimpleArithmetic, UniqueSaturatedInto,
+};
+use support::{
+	traits::{Currency, ExistenceRequirement, Imbalance, OnUnbalanced, WithdrawReason}, StorageValue,
+};
 
 #[cfg(test)]
 use std::{any::Any, fmt::Debug};
@@ -200,14 +202,6 @@ pub fn buy_gas<T: Trait>(
 	transactor: &T::AccountId,
 	gas_limit: Gas,
 ) -> Result<(GasMeter<T>, NegativeImbalanceOf<T>), &'static str> {
-	// Check if the specified amount of gas is available in the current block.
-	// This cannot underflow since `gas_spent` is never greater than `T::BlockGasLimit`.
-	let gas_available = T::BlockGasLimit::get() - <Module<T>>::gas_spent();
-	if gas_limit > gas_available {
-		// gas limit reached, revert the transaction and retry again in the future
-		return Err(BLOCK_FULL);
-	}
-
 	// Buy the specified amount of gas.
 	let gas_price = <Module<T>>::gas_price();
 	let cost = if gas_price.is_zero() {
@@ -274,7 +268,7 @@ macro_rules! match_tokens {
 			// have an iterator of Box<dyn Any> and to downcast we need to specify
 			// the type which we want downcast to.
 			//
-			// So what we do is we assign `_pattern_typed_next_ref` to the a variable which has
+			// So what we do is we assign `_pattern_typed_next_ref` to a variable which has
 			// the required type.
 			//
 			// Then we make `_pattern_typed_next_ref = token.downcast_ref()`. This makes
@@ -366,7 +360,7 @@ mod tests {
 	// Make sure that if the gas meter is charged by exceeding amount then not only an error
 	// returned for that charge, but also for all consequent charges.
 	//
-	// This is not striclty necessary, because the execution should be interrupred immediatelly
+	// This is not strictly necessary, because the execution should be interrupted immediately
 	// if the gas meter runs out of gas. However, this is just a nice property to have.
 	#[test]
 	fn overcharge_is_unrecoverable() {

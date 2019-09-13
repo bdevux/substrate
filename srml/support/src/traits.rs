@@ -18,20 +18,32 @@
 //!
 //! NOTE: If you're looking for `parameter_types`, it has moved in to the top-level module.
 
-use crate::rstd::{result, marker::PhantomData, ops::Div};
+use crate::rstd::{prelude::*, result, marker::PhantomData, ops::Div};
 use crate::codec::{Codec, Encode, Decode};
-use substrate_primitives::u32_trait::Value as U32;
-use crate::runtime_primitives::traits::{
-	MaybeSerializeDebug, SimpleArithmetic, Saturating
-};
-use crate::runtime_primitives::ConsensusEngineId;
+use primitives::u32_trait::Value as U32;
+use crate::sr_primitives::traits::{MaybeSerializeDebug, SimpleArithmetic, Saturating};
+use crate::sr_primitives::ConsensusEngineId;
 
-use super::for_each_tuple;
+/// Anything that can have a `::len()` method.
+pub trait Len {
+	/// Return the length of data type.
+	fn len(&self) -> usize;
+}
+
+impl<T: IntoIterator + Clone,> Len for T where <T as IntoIterator>::IntoIter: ExactSizeIterator {
+	fn len(&self) -> usize {
+		self.clone().into_iter().len()
+	}
+}
 
 /// A trait for querying a single fixed value from a type.
 pub trait Get<T> {
 	/// Return a constant value.
 	fn get() -> T;
+}
+
+impl<T: Default> Get<T> for () {
+	fn get() -> T { T::default() }
 }
 
 /// A trait for querying whether a type can be said to statically "contain" a value. Similar
@@ -49,28 +61,11 @@ impl<V: PartialEq, T: Get<V>> Contains<V> for T {
 }
 
 /// The account with the given id was killed.
+#[impl_trait_for_tuples::impl_for_tuples(30)]
 pub trait OnFreeBalanceZero<AccountId> {
 	/// The account was the given id was killed.
 	fn on_free_balance_zero(who: &AccountId);
 }
-
-macro_rules! impl_on_free_balance_zero {
-	() => (
-		impl<AccountId> OnFreeBalanceZero<AccountId> for () {
-			fn on_free_balance_zero(_: &AccountId) {}
-		}
-	);
-
-	( $($t:ident)* ) => {
-		impl<AccountId, $($t: OnFreeBalanceZero<AccountId>),*> OnFreeBalanceZero<AccountId> for ($($t,)*) {
-			fn on_free_balance_zero(who: &AccountId) {
-				$($t::on_free_balance_zero(who);)*
-			}
-		}
-	}
-}
-
-for_each_tuple!(impl_on_free_balance_zero);
 
 /// Trait for a hook to get called when some balance has been minted, causing dilution.
 pub trait OnDilution<Balance> {
@@ -89,19 +84,6 @@ pub enum UpdateBalanceOutcome {
 	Updated,
 	/// The update led to killing the account.
 	AccountKilled,
-}
-
-/// Simple trait designed for hooking into a transaction payment.
-///
-/// It operates over a single generic `AccountId` type.
-pub trait MakePayment<AccountId> {
-	/// Make transaction payment from `who` for an extrinsic of encoded length
-	/// `encoded_len` bytes. Return `Ok` iff the payment was successful.
-	fn make_payment(who: &AccountId, encoded_len: usize) -> Result<(), &'static str>;
-}
-
-impl<T> MakePayment<T> for () {
-	fn make_payment(_: &T, _: usize) -> Result<(), &'static str> { Ok(()) }
 }
 
 /// A trait for finding the author of a block header based on the `PreRuntime` digests contained
@@ -124,6 +106,29 @@ impl<A> FindAuthor<A> for () {
 pub trait VerifySeal<Header, Author> {
 	/// Verify a header and return the author, if any.
 	fn verify_seal(header: &Header) -> Result<Option<Author>, &'static str>;
+}
+
+/// Something which can compute and check proofs of
+/// a historical key owner and return full identification data of that
+/// key owner.
+pub trait KeyOwnerProofSystem<Key> {
+	/// The proof of membership itself.
+	type Proof: Codec;
+	/// The full identification of a key owner and the stash account.
+	type IdentificationTuple: Codec;
+
+	/// Prove membership of a key owner in the current block-state.
+	///
+	/// This should typically only be called off-chain, since it may be
+	/// computationally heavy.
+	///
+	/// Returns `Some` iff the key owner referred to by the given `key` is a
+	/// member of the current set.
+	fn prove(key: Key) -> Option<Self::Proof>;
+
+	/// Check a proof of membership on-chain. Return `Some` iff the proof is
+	/// valid and recent enough to check.
+	fn check_proof(key: Key, proof: Self::Proof) -> Option<Self::IdentificationTuple>;
 }
 
 /// Handler for when some currency "account" decreased in balance for
@@ -607,3 +612,97 @@ bitmask! {
 	}
 }
 
+pub trait Time {
+	type Moment: SimpleArithmetic + Codec + Clone + Default + Copy;
+
+	fn now() -> Self::Moment;
+}
+
+impl WithdrawReasons {
+	/// Choose all variants except for `one`.
+	///
+	/// ```rust
+	/// # use srml_support::traits::{WithdrawReason, WithdrawReasons};
+	/// # fn main() {
+	/// assert_eq!(
+	/// 	WithdrawReason::Fee | WithdrawReason::Transfer | WithdrawReason::Reserve,
+	/// 	WithdrawReasons::except(WithdrawReason::TransactionPayment),
+	///	);
+	/// # }
+	/// ```
+	pub fn except(one: WithdrawReason) -> WithdrawReasons {
+		let mut mask = Self::all();
+		mask.toggle(one);
+		mask
+	}
+}
+
+/// Trait for type that can handle incremental changes to a set of account IDs.
+pub trait ChangeMembers<AccountId: Clone + Ord> {
+	/// A number of members `incoming` just joined the set and replaced some `outgoing` ones. The
+	/// new set is given by `new`, and need not be sorted.
+	fn change_members(incoming: &[AccountId], outgoing: &[AccountId], mut new: Vec<AccountId>) {
+		new.sort_unstable();
+		Self::change_members_sorted(incoming, outgoing, &new[..]);
+	}
+
+	/// A number of members `_incoming` just joined the set and replaced some `_outgoing` ones. The
+	/// new set is thus given by `sorted_new` and **must be sorted**.
+	///
+	/// NOTE: This is the only function that needs to be implemented in `ChangeMembers`.
+	fn change_members_sorted(
+		incoming: &[AccountId],
+		outgoing: &[AccountId],
+		sorted_new: &[AccountId],
+	);
+
+	/// Set the new members; they **must already be sorted**. This will compute the diff and use it to
+	/// call `change_members_sorted`.
+	fn set_members_sorted(new_members: &[AccountId], old_members: &[AccountId]) {
+		let mut old_iter = old_members.iter();
+		let mut new_iter = new_members.iter();
+		let mut incoming = Vec::new();
+		let mut outgoing = Vec::new();
+		let mut old_i = old_iter.next();
+		let mut new_i = new_iter.next();
+		loop {
+			match (old_i, new_i) {
+				(None, None) => break,
+				(Some(old), Some(new)) if old == new => {
+					old_i = old_iter.next();
+					new_i = new_iter.next();
+				}
+				(Some(old), Some(new)) if old < new => {
+					outgoing.push(old.clone());
+					old_i = old_iter.next();
+				}
+				(Some(old), None) => {
+					outgoing.push(old.clone());
+					old_i = old_iter.next();
+				}
+				(_, Some(new)) => {
+					incoming.push(new.clone());
+					new_i = new_iter.next();
+				}
+			}
+		}
+
+		Self::change_members_sorted(&incoming[..], &outgoing[..], &new_members);
+	}
+}
+
+impl<T: Clone + Ord> ChangeMembers<T> for () {
+	fn change_members(_: &[T], _: &[T], _: Vec<T>) {}
+	fn change_members_sorted(_: &[T], _: &[T], _: &[T]) {}
+	fn set_members_sorted(_: &[T], _: &[T]) {}
+}
+
+/// Trait for type that can handle the initialization of account IDs at genesis.
+pub trait InitializeMembers<AccountId> {
+	/// Initialize the members to the given `members`.
+	fn initialize_members(members: &[AccountId]);
+}
+
+impl<T> InitializeMembers<T> for () {
+	fn initialize_members(_: &[T]) {}
+}

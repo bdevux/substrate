@@ -17,7 +17,7 @@
 #[doc(hidden)]
 pub use crate::rstd::vec::Vec;
 #[doc(hidden)]
-pub use crate::runtime_primitives::traits::{Block as BlockT, Extrinsic};
+pub use crate::sr_primitives::traits::{Block as BlockT, Extrinsic};
 #[doc(hidden)]
 pub use inherents::{InherentData, ProvideInherent, CheckInherentsResult, IsFatalError};
 
@@ -55,14 +55,16 @@ macro_rules! impl_outer_inherent {
 			fn create_extrinsics(&self) ->
 				$crate::inherent::Vec<<$block as $crate::inherent::BlockT>::Extrinsic> {
 				use $crate::inherent::ProvideInherent;
+				use $crate::inherent::Extrinsic;
 
 				let mut inherents = Vec::new();
 
 				$(
 					if let Some(inherent) = $module::create_inherent(self) {
-						inherents.push($uncheckedextrinsic::new_unsigned(
-							Call::$call(inherent))
-						);
+						inherents.push($uncheckedextrinsic::new(
+							Call::$call(inherent),
+							None,
+						).expect("Runtime UncheckedExtrinsic is not Opaque, so it has to return `Some`; qed"));
 					}
 				)*
 

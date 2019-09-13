@@ -15,11 +15,11 @@
 // along with Substrate.  If not, see <http://www.gnu.org/licenses/>.
 
 #[doc(hidden)]
-pub use crate::runtime_primitives::traits::ValidateUnsigned;
+pub use crate::sr_primitives::traits::ValidateUnsigned;
 #[doc(hidden)]
-pub use crate::runtime_primitives::transaction_validity::TransactionValidity;
+pub use crate::sr_primitives::transaction_validity::{TransactionValidity, UnknownTransaction};
 #[doc(hidden)]
-pub use crate::runtime_primitives::ApplyError;
+pub use crate::sr_primitives::ApplyError;
 
 
 /// Implement `ValidateUnsigned` for `Runtime`.
@@ -72,7 +72,7 @@ macro_rules! impl_outer_validate_unsigned {
 				#[allow(unreachable_patterns)]
 				match call {
 					$( Call::$module(inner_call) => $module::validate_unsigned(inner_call), )*
-					_ => $crate::unsigned::TransactionValidity::Invalid($crate::unsigned::ApplyError::BadSignature as i8),
+					_ => $crate::unsigned::UnknownTransaction::NoUnsignedValidator.into(),
 				}
 			}
 		}
@@ -81,8 +81,7 @@ macro_rules! impl_outer_validate_unsigned {
 
 #[cfg(test)]
 mod test_empty_call {
-	pub enum Call {
-	}
+	pub enum Call {}
 
 	#[allow(unused)]
 	pub struct Runtime;

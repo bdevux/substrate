@@ -19,7 +19,7 @@
 use crate::rstd::prelude::*;
 use crate::codec::{Codec, Encode};
 use crate::storage::unhashed;
-use sr_std::borrow::Borrow;
+use rstd::borrow::Borrow;
 
 /// An implementation of a map with a two keys.
 ///
@@ -34,8 +34,8 @@ use sr_std::borrow::Borrow;
 ///
 /// Hasher are implemented in derive_key* methods.
 pub trait StorageDoubleMapWithHasher {
-	type Key1: Codec;
-	type Key2: Codec;
+	type Key1: Encode;
+	type Key2: Encode;
 	type Value: Codec + Default;
 
 	const PREFIX: &'static [u8];

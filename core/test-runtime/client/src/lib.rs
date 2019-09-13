@@ -22,12 +22,15 @@ pub mod trait_tests;
 
 mod block_builder_ext;
 
+use std::sync::Arc;
+use std::collections::HashMap;
 pub use block_builder_ext::BlockBuilderExt;
 pub use generic_test_client::*;
 pub use runtime;
 
+use primitives::sr25519;
 use runtime::genesismap::{GenesisConfig, additional_storage_with_genesis};
-use runtime_primitives::traits::{Block as BlockT, Header as HeaderT, Hash as HashT};
+use sr_primitives::traits::{Block as BlockT, Header as HeaderT, Hash as HashT};
 
 /// A prelude to import in tests.
 pub mod prelude {
@@ -39,7 +42,7 @@ pub mod prelude {
 		Executor, LightExecutor, LocalExecutor, NativeExecutor,
 	};
 	// Keyring
-	pub use super::{AccountKeyring, AuthorityKeyring};
+	pub use super::{AccountKeyring, Sr25519Keyring};
 }
 
 mod local_executor {
@@ -50,8 +53,7 @@ mod local_executor {
 	native_executor_instance!(
 		pub LocalExecutor,
 		runtime::api::dispatch,
-		runtime::native_version,
-		runtime::WASM_BINARY
+		runtime::native_version
 	);
 }
 
@@ -71,20 +73,11 @@ pub type Executor = client::LocalCallExecutor<
 pub type LightBackend = generic_test_client::LightBackend<runtime::Block>;
 
 /// Test client light executor.
-pub type LightExecutor = client::light::call_executor::RemoteOrLocalCallExecutor<
-	runtime::Block,
+pub type LightExecutor = client::light::call_executor::GenesisCallExecutor<
 	LightBackend,
-	client::light::call_executor::RemoteCallExecutor<
-		client::light::blockchain::Blockchain<
-			client_db::light::LightStorage<runtime::Block>,
-			LightFetcher
-		>,
-		LightFetcher
-	>,
 	client::LocalCallExecutor<
 		client::light::backend::Backend<
 			client_db::light::LightStorage<runtime::Block>,
-			LightFetcher,
 			Blake2Hasher
 		>,
 		NativeExecutor<LocalExecutor>
@@ -95,19 +88,51 @@ pub type LightExecutor = client::light::call_executor::RemoteOrLocalCallExecutor
 #[derive(Default)]
 pub struct GenesisParameters {
 	support_changes_trie: bool,
+	heap_pages_override: Option<u64>,
+	extra_storage: HashMap<Vec<u8>, Vec<u8>>,
+	child_extra_storage: HashMap<Vec<u8>, HashMap<Vec<u8>, Vec<u8>>>,
+}
+
+impl GenesisParameters {
+	fn genesis_config(&self) -> GenesisConfig {
+		GenesisConfig::new(
+			self.support_changes_trie,
+			vec![
+				sr25519::Public::from(Sr25519Keyring::Alice).into(),
+				sr25519::Public::from(Sr25519Keyring::Bob).into(),
+				sr25519::Public::from(Sr25519Keyring::Charlie).into(),
+			],
+			vec![
+				AccountKeyring::Alice.into(),
+				AccountKeyring::Bob.into(),
+				AccountKeyring::Charlie.into(),
+			],
+			1000,
+			self.heap_pages_override,
+			self.extra_storage.clone(),
+			self.child_extra_storage.clone(),
+		)
+	}
 }
 
 impl generic_test_client::GenesisInit for GenesisParameters {
 	fn genesis_storage(&self) -> (StorageOverlay, ChildrenStorageOverlay) {
-		let mut storage = genesis_config(self.support_changes_trie).genesis_map();
+		use codec::Encode;
+		let mut storage = self.genesis_config().genesis_map();
 
+		let child_roots = storage.1.iter().map(|(sk, child_map)| {
+			let state_root = <<<runtime::Block as BlockT>::Header as HeaderT>::Hashing as HashT>::trie_root(
+				child_map.clone().into_iter()
+			);
+			(sk.clone(), state_root.encode())
+		});
 		let state_root = <<<runtime::Block as BlockT>::Header as HeaderT>::Hashing as HashT>::trie_root(
-			storage.clone().into_iter()
+			storage.0.clone().into_iter().chain(child_roots)
 		);
 		let block: runtime::Block = client::genesis::construct_genesis_block(state_root);
-		storage.extend(additional_storage_with_genesis(&block));
+		storage.0.extend(additional_storage_with_genesis(&block));
 
-		(storage, Default::default())
+		storage
 	}
 }
 
@@ -145,6 +170,28 @@ pub trait TestClientBuilderExt<B>: Sized {
 	/// Enable or disable support for changes trie in genesis.
 	fn set_support_changes_trie(self, support_changes_trie: bool) -> Self;
 
+	/// Override the default value for Wasm heap pages.
+	fn set_heap_pages(self, heap_pages: u64) -> Self;
+
+	/// Add an extra value into the genesis storage.
+	///
+	/// # Panics
+	///
+	/// Panics if the key is empty.
+	fn add_extra_child_storage<SK: Into<Vec<u8>>, K: Into<Vec<u8>>, V: Into<Vec<u8>>>(
+		self,
+		storage_key: SK,
+		key: K,
+		value: V,
+	) -> Self;
+
+	/// Add an extra child value into the genesis storage.
+	///
+	/// # Panics
+	///
+	/// Panics if the key is empty.
+	fn add_extra_storage<K: Into<Vec<u8>>, V: Into<Vec<u8>>>(self, key: K, value: V) -> Self;
+
 	/// Build the test client.
 	fn build(self) -> Client<B> {
 		self.build_with_longest_chain().0
@@ -160,28 +207,44 @@ impl<B> TestClientBuilderExt<B> for TestClientBuilder<
 > where
 	B: client::backend::Backend<runtime::Block, Blake2Hasher>,
 {
+	fn set_heap_pages(mut self, heap_pages: u64) -> Self {
+		self.genesis_init_mut().heap_pages_override = Some(heap_pages);
+		self
+	}
+
 	fn set_support_changes_trie(mut self, support_changes_trie: bool) -> Self {
 		self.genesis_init_mut().support_changes_trie = support_changes_trie;
 		self
 	}
 
+	fn add_extra_storage<K: Into<Vec<u8>>, V: Into<Vec<u8>>>(mut self, key: K, value: V) -> Self {
+		let key = key.into();
+		assert!(!key.is_empty());
+		self.genesis_init_mut().extra_storage.insert(key, value.into());
+		self
+	}
+
+	fn add_extra_child_storage<SK: Into<Vec<u8>>, K: Into<Vec<u8>>, V: Into<Vec<u8>>>(
+		mut self,
+		storage_key: SK,
+		key: K,
+		value: V,
+	) -> Self {
+		let storage_key = storage_key.into();
+		let key = key.into();
+		assert!(!storage_key.is_empty());
+		assert!(!key.is_empty());
+		self.genesis_init_mut().child_extra_storage
+			.entry(storage_key)
+			.or_insert_with(Default::default)
+			.insert(key, value.into());
+		self
+	}
+
+
 	fn build_with_longest_chain(self) -> (Client<B>, client::LongestChain<B, runtime::Block>) {
 		self.build_with_native_executor(None)
 	}
-}
-
-fn genesis_config(support_changes_trie: bool) -> GenesisConfig {
-	GenesisConfig::new(support_changes_trie, vec![
-		AuthorityKeyring::Alice.into(),
-		AuthorityKeyring::Bob.into(),
-		AuthorityKeyring::Charlie.into(),
-	], vec![
-		AccountKeyring::Alice.into(),
-		AccountKeyring::Bob.into(),
-		AccountKeyring::Charlie.into(),
-	],
-		1000
-	)
 }
 
 /// Creates new client instance used for tests.
@@ -190,19 +253,25 @@ pub fn new() -> Client<Backend> {
 }
 
 /// Creates new light client instance used for tests.
-pub fn new_light() -> client::Client<LightBackend, LightExecutor, runtime::Block, runtime::RuntimeApi> {
-	use std::sync::Arc;
+pub fn new_light() -> (
+	client::Client<LightBackend, LightExecutor, runtime::Block, runtime::RuntimeApi>,
+	Arc<LightBackend>,
+) {
 
 	let storage = client_db::light::LightStorage::new_test();
 	let blockchain = Arc::new(client::light::blockchain::Blockchain::new(storage));
 	let backend = Arc::new(LightBackend::new(blockchain.clone()));
 	let executor = NativeExecutor::new(None);
-	let fetcher = Arc::new(LightFetcher);
-	let remote_call_executor = client::light::call_executor::RemoteCallExecutor::new(blockchain.clone(), fetcher);
-	let local_call_executor = client::LocalCallExecutor::new(backend.clone(), executor);
-	let call_executor = LightExecutor::new(backend.clone(), remote_call_executor, local_call_executor);
+	let local_call_executor = client::LocalCallExecutor::new(backend.clone(), executor, None);
+	let call_executor = LightExecutor::new(
+		backend.clone(),
+		local_call_executor,
+	);
 
-	TestClientBuilder::with_backend(backend)
-		.build_with_executor(call_executor)
-		.0
+	(
+		TestClientBuilder::with_backend(backend.clone())
+			.build_with_executor(call_executor)
+			.0,
+		backend,
+	)
 }

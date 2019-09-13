@@ -16,16 +16,16 @@
 
 //! In memory client backend
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use parking_lot::{RwLock, Mutex};
 use primitives::{ChangesTrieConfiguration, storage::well_known_keys};
-use runtime_primitives::generic::{BlockId, DigestItem};
-use runtime_primitives::traits::{Block as BlockT, Header as HeaderT, Zero, NumberFor};
-use runtime_primitives::{Justification, StorageOverlay, ChildrenStorageOverlay};
+use sr_primitives::generic::{BlockId, DigestItem};
+use sr_primitives::traits::{Block as BlockT, Header as HeaderT, Zero, NumberFor};
+use sr_primitives::{Justification, StorageOverlay, ChildrenStorageOverlay};
 use state_machine::backend::{Backend as StateBackend, InMemory};
-use state_machine::{self, InMemoryChangesTrieStorage, ChangesTrieAnchorBlockId};
-use hash_db::Hasher;
+use state_machine::{self, InMemoryChangesTrieStorage, ChangesTrieAnchorBlockId, ChangesTrieTransaction};
+use hash_db::{Hasher, Prefix};
 use trie::MemoryDB;
 use consensus::well_known_cache_keys::Id as CacheKeyId;
 
@@ -223,7 +223,7 @@ impl<Block: BlockT> Blockchain<Block> {
 				None
 			} else {
 				let route = crate::blockchain::tree_route(
-					self,
+					|id| self.header(id)?.ok_or_else(|| error::Error::UnknownBlock(format!("{:?}", id))),
 					BlockId::Hash(best_hash),
 					BlockId::Hash(*header.parent_hash()),
 				)?;
@@ -484,8 +484,8 @@ where
 		Ok(())
 	}
 
-	fn update_changes_trie(&mut self, update: MemoryDB<H>) -> error::Result<()> {
-		self.changes_trie_update = Some(update);
+	fn update_changes_trie(&mut self, update: ChangesTrieTransaction<H, NumberFor<Block>>) -> error::Result<()> {
+		self.changes_trie_update = Some(update.0);
 		Ok(())
 	}
 
@@ -532,7 +532,10 @@ where
 	}
 }
 
-/// In-memory backend. Keeps all states and blocks in memory. Useful for testing.
+/// In-memory backend. Keeps all states and blocks in memory.
+///
+/// > **Warning**: Doesn't support all the features necessary for a proper database. Only use this
+/// > struct for testing purposes. Do **NOT** use in production.
 pub struct Backend<Block, H>
 where
 	Block: BlockT,
@@ -715,6 +718,10 @@ where
 			.map(|num| num.is_zero())
 			.unwrap_or(false)
 	}
+
+	fn remote_blockchain(&self) -> Arc<dyn crate::light::blockchain::RemoteBlockchain<Block>> {
+		unimplemented!()
+	}
 }
 
 /// Prunable in-memory changes trie storage.
@@ -755,8 +762,20 @@ impl<Block, H> state_machine::ChangesTrieStorage<H, NumberFor<Block>> for Change
 		Block: BlockT,
 		H: Hasher,
 {
-	fn get(&self, _key: &H::Out, _prefix: &[u8]) -> Result<Option<state_machine::DBValue>, String> {
-		Err("Dummy implementation".into())
+	fn as_roots_storage(&self) -> &dyn state_machine::ChangesTrieRootsStorage<H, NumberFor<Block>> {
+		self
+	}
+
+	fn with_cached_changed_keys(
+		&self,
+		_root: &H::Out,
+		_functor: &mut dyn FnMut(&HashMap<Option<Vec<u8>>, HashSet<Vec<u8>>>),
+	) -> bool {
+		false
+	}
+
+	fn get(&self, key: &H::Out, prefix: Prefix) -> Result<Option<state_machine::DBValue>, String> {
+		self.0.get(key, prefix)
 	}
 }
 
@@ -794,19 +813,23 @@ impl backend::OffchainStorage for OffchainStorage {
 		&mut self,
 		prefix: &[u8],
 		key: &[u8],
-		old_value: &[u8],
+		old_value: Option<&[u8]>,
 		new_value: &[u8],
 	) -> bool {
+		use std::collections::hash_map::Entry;
 		let key = prefix.iter().chain(key).cloned().collect();
 
-		let mut set = false;
-		self.storage.entry(key).and_modify(|val| {
-			if val.as_slice() == old_value {
-				*val = new_value.to_vec();
-				set = true;
-			}
-		});
-		set
+		match self.storage.entry(key) {
+			Entry::Vacant(entry) => if old_value.is_none() {
+				entry.insert(new_value.to_vec());
+				true
+			} else { false },
+			Entry::Occupied(ref mut entry) if Some(entry.get().as_slice()) == old_value => {
+				entry.insert(new_value.to_vec());
+				true
+			},
+			_ => false,
+		}
 	}
 }
 
@@ -845,9 +868,13 @@ mod tests {
 		assert_eq!(storage.get(b"A", b"B"), Some(b"C".to_vec()));
 		assert_eq!(storage.get(b"B", b"A"), None);
 
-		storage.compare_and_set(b"A", b"B", b"X", b"D");
+		storage.compare_and_set(b"A", b"B", Some(b"X"), b"D");
 		assert_eq!(storage.get(b"A", b"B"), Some(b"C".to_vec()));
-		storage.compare_and_set(b"A", b"B", b"C", b"D");
+		storage.compare_and_set(b"A", b"B", Some(b"C"), b"D");
 		assert_eq!(storage.get(b"A", b"B"), Some(b"D".to_vec()));
+
+		assert!(!storage.compare_and_set(b"B", b"A", Some(b""), b"Y"));
+		assert!(storage.compare_and_set(b"B", b"A", None, b"X"));
+		assert_eq!(storage.get(b"B", b"A"), Some(b"X".to_vec()));
 	}
 }

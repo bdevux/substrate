@@ -20,12 +20,13 @@
 
 use crate::error::{Result, Error};
 use std::{collections::HashMap, rc::Rc};
-use parity_codec::{Decode, Encode};
+use codec::{Decode, Encode};
 use primitives::sandbox as sandbox_primitives;
 use wasmi::{
 	Externals, FuncRef, ImportResolver, MemoryInstance, MemoryRef, Module, ModuleInstance,
 	ModuleRef, RuntimeArgs, RuntimeValue, Trap, TrapKind, memory_units::Pages,
 };
+use wasm_interface::{Pointer, WordSize};
 
 /// Index of a function inside the supervisor.
 ///
@@ -150,7 +151,7 @@ pub trait SandboxCapabilities {
 	/// Returns `Err` if allocation not possible or errors during heap management.
 	///
 	/// Returns pointer to the allocated block.
-	fn allocate(&mut self, len: u32) -> Result<u32>;
+	fn allocate(&mut self, len: WordSize) -> Result<Pointer<u8>>;
 
 	/// Deallocate space specified by the pointer that was previously returned by [`allocate`].
 	///
@@ -159,21 +160,21 @@ pub trait SandboxCapabilities {
 	/// Returns `Err` if deallocation not possible or because of errors in heap management.
 	///
 	/// [`allocate`]: #tymethod.allocate
-	fn deallocate(&mut self, ptr: u32) -> Result<()>;
+	fn deallocate(&mut self, ptr: Pointer<u8>) -> Result<()>;
 
 	/// Write `data` into the supervisor memory at offset specified by `ptr`.
 	///
 	/// # Errors
 	///
 	/// Returns `Err` if `ptr + data.len()` is out of bounds.
-	fn write_memory(&mut self, ptr: u32, data: &[u8]) -> Result<()>;
+	fn write_memory(&mut self, ptr: Pointer<u8>, data: &[u8]) -> Result<()>;
 
 	/// Read `len` bytes from the supervisor memory.
 	///
 	/// # Errors
 	///
 	/// Returns `Err` if `ptr + len` is out of bounds.
-	fn read_memory(&self, ptr: u32, len: u32) -> Result<Vec<u8>>;
+	fn read_memory(&self, ptr: Pointer<u8>, len: WordSize) -> Result<Vec<u8>>;
 }
 
 /// Implementation of [`Externals`] that allows execution of guest module with
@@ -187,13 +188,13 @@ pub struct GuestExternals<'a, FE: SandboxCapabilities + Externals + 'a> {
 }
 
 fn trap(msg: &'static str) -> Trap {
-	TrapKind::Host(Box::new(Error::Other(msg))).into()
+	TrapKind::Host(Box::new(Error::Other(msg.into()))).into()
 }
 
 fn deserialize_result(serialized_result: &[u8]) -> std::result::Result<Option<RuntimeValue>, Trap> {
 	use self::sandbox_primitives::{HostError, ReturnValue};
 	let result_val = std::result::Result::<ReturnValue, HostError>::decode(&mut &serialized_result[..])
-		.ok_or_else(|| trap("Decoding Result<ReturnValue, HostError> failed!"))?;
+		.map_err(|_| trap("Decoding Result<ReturnValue, HostError> failed!"))?;
 
 	match result_val {
 		Ok(return_value) => Ok(match return_value {
@@ -243,7 +244,7 @@ impl<'a, FE: SandboxCapabilities + Externals + 'a> Externals for GuestExternals<
 		let result = ::wasmi::FuncInstance::invoke(
 			&dispatch_thunk,
 			&[
-				RuntimeValue::I32(invoke_args_ptr as i32),
+				RuntimeValue::I32(u32::from(invoke_args_ptr) as i32),
 				RuntimeValue::I32(invoke_args_data.len() as i32),
 				RuntimeValue::I32(state as i32),
 				RuntimeValue::I32(func_idx.0 as i32),
@@ -260,7 +261,7 @@ impl<'a, FE: SandboxCapabilities + Externals + 'a> Externals for GuestExternals<
 				let v = v as u64;
 				let ptr = (v as u64 >> 32) as u32;
 				let len = (v & 0xFFFFFFFF) as u32;
-				(ptr, len)
+				(Pointer::new(ptr), len)
 			}
 			Ok(_) => return Err(trap("Supervisor function returned unexpected result!")),
 			Err(_) => return Err(trap("Supervisor function trapped!")),
@@ -361,7 +362,7 @@ fn decode_environment_definition(
 	memories: &[Option<MemoryRef>],
 ) -> std::result::Result<(Imports, GuestToSupervisorFunctionMapping), InstantiationError> {
 	let env_def = sandbox_primitives::EnvironmentDefinition::decode(&mut &raw_env_def[..])
-		.ok_or_else(|| InstantiationError::EnvironmentDefinitionCorrupted)?;
+		.map_err(|_| InstantiationError::EnvironmentDefinitionCorrupted)?;
 
 	let mut func_map = HashMap::new();
 	let mut memories_map = HashMap::new();
@@ -643,7 +644,10 @@ mod tests {
 		if let Err(err) = res {
 			assert_eq!(
 				format!("{}", err),
-				format!("{}", wasmi::Error::Trap(Error::AllocatorOutOfSpace.into()))
+				format!(
+					"{}",
+					wasmi::Error::Trap(Error::FunctionExecution("AllocatorOutOfSpace".into()).into()),
+				),
 			);
 		}
 	}

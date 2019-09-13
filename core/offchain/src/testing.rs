@@ -28,9 +28,8 @@ use primitives::offchain::{
 	HttpRequestId as RequestId,
 	HttpRequestStatus as RequestStatus,
 	Timestamp,
-	CryptoKind,
-	CryptoKeyId,
 	StorageKind,
+	OpaqueNetworkState,
 };
 
 /// Pending request.
@@ -135,27 +134,15 @@ impl TestOffchainExt {
 }
 
 impl offchain::Externalities for TestOffchainExt {
+	fn is_validator(&self) -> bool {
+		unimplemented!("not needed in tests so far")
+	}
+
 	fn submit_transaction(&mut self, _ex: Vec<u8>) -> Result<(), ()> {
 		unimplemented!("not needed in tests so far")
 	}
 
-	fn new_crypto_key(&mut self, _crypto: CryptoKind) -> Result<CryptoKeyId, ()> {
-		unimplemented!("not needed in tests so far")
-	}
-
-	fn encrypt(&mut self, _key: Option<CryptoKeyId>, _data: &[u8]) -> Result<Vec<u8>, ()> {
-		unimplemented!("not needed in tests so far")
-	}
-
-	fn decrypt(&mut self, _key: Option<CryptoKeyId>, _data: &[u8]) -> Result<Vec<u8>, ()> {
-		unimplemented!("not needed in tests so far")
-	}
-
-	fn sign(&mut self, _key: Option<CryptoKeyId>, _data: &[u8]) -> Result<Vec<u8>, ()> {
-		unimplemented!("not needed in tests so far")
-	}
-
-	fn verify(&mut self, _key: Option<CryptoKeyId>, _msg: &[u8], _signature: &[u8]) -> Result<bool, ()> {
+	fn network_state(&self) -> Result<OpaqueNetworkState, ()> {
 		unimplemented!("not needed in tests so far")
 	}
 
@@ -183,7 +170,7 @@ impl offchain::Externalities for TestOffchainExt {
 		&mut self,
 		kind: StorageKind,
 		key: &[u8],
-		old_value: &[u8],
+		old_value: Option<&[u8]>,
 		new_value: &[u8]
 	) -> bool {
 		let mut state = self.0.write();
@@ -261,7 +248,7 @@ impl offchain::Externalities for TestOffchainExt {
 
 		ids.iter().map(|id| match state.requests.get(id) {
 			Some(req) if req.response.is_empty() => RequestStatus::DeadlineReached,
-			None => RequestStatus::Unknown,
+			None => RequestStatus::Invalid,
 			_ => RequestStatus::Finished(200),
 		}).collect()
 	}
@@ -302,4 +289,3 @@ impl offchain::Externalities for TestOffchainExt {
 		}
 	}
 }
-

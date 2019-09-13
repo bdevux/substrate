@@ -15,10 +15,10 @@
 // along with Substrate. If not, see <http://www.gnu.org/licenses/>.
 
 use crate::{BalanceOf, ContractInfo, ContractInfoOf, TombstoneContractInfo, Trait, AliveContractInfo};
-use runtime_primitives::traits::{Bounded, CheckedDiv, CheckedMul, Saturating, Zero,
+use sr_primitives::traits::{Bounded, CheckedDiv, CheckedMul, Saturating, Zero,
 	SaturatedConversion};
-use srml_support::traits::{Currency, ExistenceRequirement, Get, WithdrawReason};
-use srml_support::StorageMap;
+use support::traits::{Currency, ExistenceRequirement, Get, WithdrawReason};
+use support::StorageMap;
 
 #[derive(PartialEq, Eq, Copy, Clone)]
 #[must_use]

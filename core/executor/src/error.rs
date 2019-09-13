@@ -16,7 +16,6 @@
 
 //! Rust executor possible errors.
 
-use state_machine;
 use serializer;
 use wasmi;
 
@@ -38,8 +37,8 @@ pub enum Error {
 	#[display(fmt="Method not found: '{}'", _0)]
 	MethodNotFound(String),
 	/// Code is invalid (expected single byte)
-	#[display(fmt="Invalid Code: {:?}", _0)]
-	InvalidCode(Vec<u8>),
+	#[display(fmt="Invalid Code: {}", _0)]
+	InvalidCode(String),
 	/// Could not get runtime version.
 	#[display(fmt="On-chain runtime does not specify version")]
 	VersionInvalid,
@@ -58,8 +57,15 @@ pub enum Error {
 	/// Invalid memory reference.
 	#[display(fmt="Invalid memory reference")]
 	InvalidMemoryReference,
+	/// The runtime must provide a global named `__heap_base` of type i32 for specifying where the
+	/// allocator is allowed to place its data.
+	#[display(fmt="The runtime doesn't provide a global named `__heap_base`")]
+	HeapBaseNotFoundOrInvalid,
+	/// The runtime WebAssembly module is not allowed to have the `start` function.
+	#[display(fmt="The runtime has the `start` function")]
+	RuntimeHasStartFn,
 	/// Some other error occurred
-	Other(&'static str),
+	Other(String),
 	/// Some error occurred in the allocator
 	#[display(fmt="Error in allocator: {}", _0)]
 	Allocator(&'static str),
@@ -69,6 +75,9 @@ pub enum Error {
 	/// Someone tried to allocate more memory than the allowed maximum per allocation.
 	#[display(fmt="Requested allocation size is too large")]
 	RequestedAllocationTooLarge,
+	/// Executing the given function failed with the given error.
+	#[display(fmt="Function execution failed with: {}", _0)]
+	FunctionExecution(String),
 }
 
 impl std::error::Error for Error {
@@ -82,12 +91,10 @@ impl std::error::Error for Error {
 	}
 }
 
-impl state_machine::Error for Error {}
-
 impl wasmi::HostError for Error {}
 
-impl From<&'static str> for Error {
-	fn from(err: &'static str) -> Error {
+impl From<String> for Error {
+	fn from(err: String) -> Error {
 		Error::Other(err)
 	}
 }

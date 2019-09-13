@@ -14,9 +14,9 @@
 // You should have received a copy of the GNU General Public License
 // along with Substrate.  If not, see <http://www.gnu.org/licenses/>.
 
-use srml_support::runtime_primitives::generic;
-use srml_support::runtime_primitives::traits::{BlakeTwo256, Block as _, Verify};
-use srml_support::codec::{Encode, Decode};
+use support::sr_primitives::generic;
+use support::sr_primitives::traits::{BlakeTwo256, Block as _, Verify};
+use support::codec::{Encode, Decode};
 use primitives::{H256, sr25519};
 use serde::{Serialize, Deserialize};
 
@@ -82,7 +82,7 @@ mod module {
 
 	pub trait Trait: system::Trait {}
 
-	srml_support::decl_module! {
+	support::decl_module! {
 		pub struct Module<T: Trait> for enum Call where origin: T::Origin {}
 	}
 
@@ -99,7 +99,7 @@ mod module {
 		}
 	}
 
-	srml_support::decl_storage! {
+	support::decl_storage! {
 		trait Store for Module<T: Trait> as Actors {
 			/// requirements to enter and maintain status in roles
 			pub Parameters get(parameters) build(|config: &GenesisConfig| {
@@ -152,7 +152,7 @@ pub type BlockNumber = u64;
 pub type Index = u64;
 pub type Header = generic::Header<BlockNumber, BlakeTwo256>;
 pub type Block = generic::Block<Header, UncheckedExtrinsic>;
-pub type UncheckedExtrinsic = generic::UncheckedMortalCompactExtrinsic<u32, Index, Call, Signature>;
+pub type UncheckedExtrinsic = generic::UncheckedExtrinsic<u32, Call, Signature, ()>;
 
 impl system::Trait for Runtime {
 	type Hash = H256;
@@ -164,7 +164,7 @@ impl system::Trait for Runtime {
 
 impl module::Trait for Runtime {}
 
-srml_support::construct_runtime!(
+support::construct_runtime!(
 	pub enum Runtime where
 		Block = Block,
 		NodeBlock = Block,

@@ -19,11 +19,11 @@
 
 use crate::{CodeHash, Schedule, Trait};
 use crate::wasm::env_def::FunctionImplProvider;
-use crate::exec::{Ext, EmptyOutputBuf, VmExecResult};
+use crate::exec::{Ext, ExecResult};
 use crate::gas::GasMeter;
 
 use rstd::prelude::*;
-use parity_codec::{Encode, Decode};
+use codec::{Encode, Decode};
 use sandbox;
 
 #[macro_use]
@@ -109,11 +109,10 @@ impl<'a, T: Trait> crate::exec::Vm<T> for WasmVm<'a> {
 	fn execute<E: Ext<T = T>>(
 		&self,
 		exec: &WasmExecutable,
-		ext: &mut E,
-		input_data: &[u8],
-		empty_output_buf: EmptyOutputBuf,
+		mut ext: E,
+		input_data: Vec<u8>,
 		gas_meter: &mut GasMeter<E::T>,
-	) -> VmExecResult {
+	) -> ExecResult {
 		let memory =
 			sandbox::Memory::new(exec.prefab_module.initial, Some(exec.prefab_module.maximum))
 				.unwrap_or_else(|_| {
@@ -133,39 +132,18 @@ impl<'a, T: Trait> crate::exec::Vm<T> for WasmVm<'a> {
 		});
 
 		let mut runtime = Runtime::new(
-			ext,
-			input_data.to_vec(),
-			empty_output_buf,
+			&mut ext,
+			input_data,
 			&self.schedule,
 			memory,
 			gas_meter,
 		);
 
-		// Instantiate the instance from the instrumented module code.
-		match sandbox::Instance::new(&exec.prefab_module.code, &imports, &mut runtime) {
-			// No errors or traps were generated on instantiation! That
-			// means we can now invoke the contract entrypoint.
-			Ok(mut instance) => {
-				let err = instance
-					.invoke(exec.entrypoint_name, &[], &mut runtime)
-					.err();
-				to_execution_result(runtime, err)
-			}
-			// `start` function trapped. Treat it in the same manner as an execution error.
-			Err(err @ sandbox::Error::Execution) => to_execution_result(runtime, Some(err)),
-			Err(_err @ sandbox::Error::Module) => {
-				// `Error::Module` is returned only if instantiation or linking failed (i.e.
-				// wasm binary tried to import a function that is not provided by the host).
-				// This shouldn't happen because validation process ought to reject such binaries.
-				//
-				// Because panics are really undesirable in the runtime code, we treat this as
-				// a trap for now. Eventually, we might want to revisit this.
-				return VmExecResult::Trap("validation error");
-			}
-			// Other instantiation errors.
-			// Return without executing anything.
-			Err(_) => return VmExecResult::Trap("during start function"),
-		}
+		// Instantiate the instance from the instrumented module code and invoke the contract
+		// entrypoint.
+		let result = sandbox::Instance::new(&exec.prefab_module.code, &imports, &mut runtime)
+			.and_then(|mut instance| instance.invoke(exec.entrypoint_name, &[], &mut runtime));
+		to_execution_result(runtime, result)
 	}
 }
 
@@ -173,17 +151,27 @@ impl<'a, T: Trait> crate::exec::Vm<T> for WasmVm<'a> {
 mod tests {
 	use super::*;
 	use std::collections::HashMap;
-	use substrate_primitives::H256;
-	use crate::exec::{CallReceipt, Ext, InstantiateReceipt, EmptyOutputBuf, StorageKey};
+	use primitives::H256;
+	use crate::exec::{Ext, StorageKey, ExecError, ExecReturnValue, STATUS_SUCCESS};
 	use crate::gas::{Gas, GasMeter};
 	use crate::tests::{Test, Call};
 	use crate::wasm::prepare::prepare_contract;
 	use crate::CodeHash;
 	use wabt;
 	use hex_literal::hex;
+	use assert_matches::assert_matches;
 
 	#[derive(Debug, PartialEq, Eq)]
 	struct DispatchEntry(Call);
+
+	#[derive(Debug, PartialEq, Eq)]
+	struct RestoreEntry {
+		dest: u64,
+		code_hash: H256,
+		rent_allowance: u64,
+		delta: Vec<StorageKey>,
+	}
+
 	#[derive(Debug, PartialEq, Eq)]
 	struct CreateEntry {
 		code_hash: H256,
@@ -191,6 +179,7 @@ mod tests {
 		data: Vec<u8>,
 		gas_left: u64,
 	}
+
 	#[derive(Debug, PartialEq, Eq)]
 	struct TransferEntry {
 		to: u64,
@@ -198,6 +187,7 @@ mod tests {
 		data: Vec<u8>,
 		gas_left: u64,
 	}
+
 	#[derive(Default)]
 	pub struct MockExt {
 		storage: HashMap<StorageKey, Vec<u8>>,
@@ -205,26 +195,31 @@ mod tests {
 		creates: Vec<CreateEntry>,
 		transfers: Vec<TransferEntry>,
 		dispatches: Vec<DispatchEntry>,
+		restores: Vec<RestoreEntry>,
 		// (topics, data)
 		events: Vec<(Vec<H256>, Vec<u8>)>,
 		next_account_id: u64,
 	}
+
 	impl Ext for MockExt {
 		type T = Test;
 
 		fn get_storage(&self, key: &StorageKey) -> Option<Vec<u8>> {
 			self.storage.get(key).cloned()
 		}
-		fn set_storage(&mut self, key: StorageKey, value: Option<Vec<u8>>) {
+		fn set_storage(&mut self, key: StorageKey, value: Option<Vec<u8>>)
+			-> Result<(), &'static str>
+		{
 			*self.storage.entry(key).or_insert(Vec::new()) = value.unwrap_or(Vec::new());
+			Ok(())
 		}
 		fn instantiate(
 			&mut self,
 			code_hash: &CodeHash<Test>,
 			endowment: u64,
 			gas_meter: &mut GasMeter<Test>,
-			data: &[u8],
-		) -> Result<InstantiateReceipt<u64>, &'static str> {
+			data: Vec<u8>,
+		) -> Result<(u64, ExecReturnValue), ExecError> {
 			self.creates.push(CreateEntry {
 				code_hash: code_hash.clone(),
 				endowment,
@@ -234,16 +229,15 @@ mod tests {
 			let address = self.next_account_id;
 			self.next_account_id += 1;
 
-			Ok(InstantiateReceipt { address })
+			Ok((address, ExecReturnValue { status: STATUS_SUCCESS, data: Vec::new() }))
 		}
 		fn call(
 			&mut self,
 			to: &u64,
 			value: u64,
 			gas_meter: &mut GasMeter<Test>,
-			data: &[u8],
-			_output_data: EmptyOutputBuf,
-		) -> Result<CallReceipt, &'static str> {
+			data: Vec<u8>,
+		) -> ExecResult {
 			self.transfers.push(TransferEntry {
 				to: *to,
 				value,
@@ -252,12 +246,24 @@ mod tests {
 			});
 			// Assume for now that it was just a plain transfer.
 			// TODO: Add tests for different call outcomes.
-			Ok(CallReceipt {
-				output_data: Vec::new(),
-			})
+			Ok(ExecReturnValue { status: STATUS_SUCCESS, data: Vec::new() })
 		}
 		fn note_dispatch_call(&mut self, call: Call) {
 			self.dispatches.push(DispatchEntry(call));
+		}
+		fn note_restore_to(
+			&mut self,
+			dest: u64,
+			code_hash: H256,
+			rent_allowance: u64,
+			delta: Vec<StorageKey>,
+		) {
+			self.restores.push(RestoreEntry {
+				dest,
+				code_hash,
+				rent_allowance,
+				delta,
+			});
 		}
 		fn caller(&self) -> &u64 {
 			&42
@@ -276,6 +282,10 @@ mod tests {
 			&1111
 		}
 
+		fn minimum_balance(&self) -> u64 {
+			666
+		}
+
 		fn random(&self, subject: &[u8]) -> H256 {
 			H256::from_slice(subject)
 		}
@@ -291,15 +301,102 @@ mod tests {
 		fn rent_allowance(&self) -> u64 {
 			self.rent_allowance
 		}
+
+		fn block_number(&self) -> u64 { 121 }
+
+		fn max_value_size(&self) -> u32 { 16_384 }
+	}
+
+	impl Ext for &mut MockExt {
+		type T = <MockExt as Ext>::T;
+
+		fn get_storage(&self, key: &[u8; 32]) -> Option<Vec<u8>> {
+			(**self).get_storage(key)
+		}
+		fn set_storage(&mut self, key: [u8; 32], value: Option<Vec<u8>>)
+			-> Result<(), &'static str>
+		{
+			(**self).set_storage(key, value)
+		}
+		fn instantiate(
+			&mut self,
+			code: &CodeHash<Test>,
+			value: u64,
+			gas_meter: &mut GasMeter<Test>,
+			input_data: Vec<u8>,
+		) -> Result<(u64, ExecReturnValue), ExecError> {
+			(**self).instantiate(code, value, gas_meter, input_data)
+		}
+		fn call(
+			&mut self,
+			to: &u64,
+			value: u64,
+			gas_meter: &mut GasMeter<Test>,
+			input_data: Vec<u8>,
+		) -> ExecResult {
+			(**self).call(to, value, gas_meter, input_data)
+		}
+		fn note_dispatch_call(&mut self, call: Call) {
+			(**self).note_dispatch_call(call)
+		}
+		fn note_restore_to(
+			&mut self,
+			dest: u64,
+			code_hash: H256,
+			rent_allowance: u64,
+			delta: Vec<StorageKey>,
+		) {
+			(**self).note_restore_to(
+				dest,
+				code_hash,
+				rent_allowance,
+				delta,
+			)
+		}
+		fn caller(&self) -> &u64 {
+			(**self).caller()
+		}
+		fn address(&self) -> &u64 {
+			(**self).address()
+		}
+		fn balance(&self) -> u64 {
+			(**self).balance()
+		}
+		fn value_transferred(&self) -> u64 {
+			(**self).value_transferred()
+		}
+		fn now(&self) -> &u64 {
+			(**self).now()
+		}
+		fn minimum_balance(&self) -> u64 {
+			(**self).minimum_balance()
+		}
+		fn random(&self, subject: &[u8]) -> H256 {
+			(**self).random(subject)
+		}
+		fn deposit_event(&mut self, topics: Vec<H256>, data: Vec<u8>) {
+			(**self).deposit_event(topics, data)
+		}
+		fn set_rent_allowance(&mut self, rent_allowance: u64) {
+			(**self).set_rent_allowance(rent_allowance)
+		}
+		fn rent_allowance(&self) -> u64 {
+			(**self).rent_allowance()
+		}
+		fn block_number(&self) -> u64 {
+			(**self).block_number()
+		}
+		fn max_value_size(&self) -> u32 {
+			(**self).max_value_size()
+		}
 	}
 
 	fn execute<E: Ext>(
 		wat: &str,
-		input_data: &[u8],
-		output_data: &mut Vec<u8>,
-		ext: &mut E,
+		input_data: Vec<u8>,
+		ext: E,
 		gas_meter: &mut GasMeter<E::T>,
-	) -> Result<(), &'static str> {
+	) -> ExecResult {
 		use crate::exec::Vm;
 
 		let wasm = wabt::wat2wasm(wat).unwrap();
@@ -316,11 +413,7 @@ mod tests {
 		let cfg = Default::default();
 		let vm = WasmVm::new(&cfg);
 
-		*output_data = vm
-			.execute(&exec, ext, input_data, EmptyOutputBuf::new(), gas_meter)
-			.into_result()?;
-
-		Ok(())
+		vm.execute(&exec, ext, input_data, gas_meter)
 	}
 
 	const CODE_TRANSFER: &str = r#"
@@ -365,14 +458,12 @@ mod tests {
 	#[test]
 	fn contract_transfer() {
 		let mut mock_ext = MockExt::default();
-		execute(
+		let _ = execute(
 			CODE_TRANSFER,
-			&[],
-			&mut Vec::new(),
+			vec![],
 			&mut mock_ext,
 			&mut GasMeter::with_limit(50_000, 1),
-		)
-		.unwrap();
+		).unwrap();
 
 		assert_eq!(
 			&mock_ext.transfers,
@@ -429,14 +520,12 @@ mod tests {
 	#[test]
 	fn contract_create() {
 		let mut mock_ext = MockExt::default();
-		execute(
+		let _ = execute(
 			CODE_CREATE,
-			&[],
-			&mut Vec::new(),
+			vec![],
 			&mut mock_ext,
 			&mut GasMeter::with_limit(50_000, 1),
-		)
-		.unwrap();
+		).unwrap();
 
 		assert_eq!(
 			&mock_ext.creates,
@@ -491,14 +580,12 @@ mod tests {
 	#[test]
 	fn contract_call_limited_gas() {
 		let mut mock_ext = MockExt::default();
-		execute(
+		let _ = execute(
 			&CODE_TRANSFER_LIMITED_GAS,
-			&[],
-			&mut Vec::new(),
+			vec![],
 			&mut mock_ext,
 			&mut GasMeter::with_limit(50_000, 1),
-		)
-		.unwrap();
+		).unwrap();
 
 		assert_eq!(
 			&mock_ext.transfers,
@@ -515,7 +602,7 @@ mod tests {
 (module
 	(import "env" "ext_get_storage" (func $ext_get_storage (param i32) (result i32)))
 	(import "env" "ext_scratch_size" (func $ext_scratch_size (result i32)))
-	(import "env" "ext_scratch_copy" (func $ext_scratch_copy (param i32 i32 i32)))
+	(import "env" "ext_scratch_read" (func $ext_scratch_read (param i32 i32 i32)))
 	(import "env" "ext_return" (func $ext_return (param i32 i32)))
 	(import "env" "memory" (memory 1 1))
 
@@ -551,7 +638,7 @@ mod tests {
 		)
 
 		;; Copy scratch buffer into this contract memory.
-		(call $ext_scratch_copy
+		(call $ext_scratch_read
 			(i32.const 36)		;; The pointer where to store the scratch buffer contents,
 								;; 36 = 4 + 32
 			(i32.const 0)		;; Offset from the start of the scratch buffer.
@@ -586,17 +673,14 @@ mod tests {
 			.storage
 			.insert([0x11; 32], [0x22; 32].to_vec());
 
-		let mut return_buf = Vec::new();
-		execute(
+		let output = execute(
 			CODE_GET_STORAGE,
-			&[],
-			&mut return_buf,
-			&mut mock_ext,
+			vec![],
+			mock_ext,
 			&mut GasMeter::with_limit(50_000, 1),
-		)
-		.unwrap();
+		).unwrap();
 
-		assert_eq!(return_buf, [0x22; 32].to_vec());
+		assert_eq!(output, ExecReturnValue { status: STATUS_SUCCESS, data: [0x22; 32].to_vec() });
 	}
 
 	/// calls `ext_caller`, loads the address from the scratch buffer and
@@ -605,7 +689,7 @@ mod tests {
 (module
 	(import "env" "ext_caller" (func $ext_caller))
 	(import "env" "ext_scratch_size" (func $ext_scratch_size (result i32)))
-	(import "env" "ext_scratch_copy" (func $ext_scratch_copy (param i32 i32 i32)))
+	(import "env" "ext_scratch_read" (func $ext_scratch_read (param i32 i32 i32)))
 	(import "env" "memory" (memory 1 1))
 
 	(func $assert (param i32)
@@ -630,7 +714,7 @@ mod tests {
 		)
 
 		;; copy contents of the scratch buffer into the contract's memory.
-		(call $ext_scratch_copy
+		(call $ext_scratch_read
 			(i32.const 8)		;; Pointer in memory to the place where to copy.
 			(i32.const 0)		;; Offset from the start of the scratch buffer.
 			(i32.const 8)		;; Count of bytes to copy.
@@ -653,15 +737,12 @@ mod tests {
 
 	#[test]
 	fn caller() {
-		let mut mock_ext = MockExt::default();
-		execute(
+		let _ = execute(
 			CODE_CALLER,
-			&[],
-			&mut Vec::new(),
-			&mut mock_ext,
+			vec![],
+			MockExt::default(),
 			&mut GasMeter::with_limit(50_000, 1),
-		)
-		.unwrap();
+		).unwrap();
 	}
 
 	/// calls `ext_address`, loads the address from the scratch buffer and
@@ -670,7 +751,7 @@ mod tests {
 (module
 	(import "env" "ext_address" (func $ext_address))
 	(import "env" "ext_scratch_size" (func $ext_scratch_size (result i32)))
-	(import "env" "ext_scratch_copy" (func $ext_scratch_copy (param i32 i32 i32)))
+	(import "env" "ext_scratch_read" (func $ext_scratch_read (param i32 i32 i32)))
 	(import "env" "memory" (memory 1 1))
 
 	(func $assert (param i32)
@@ -695,7 +776,7 @@ mod tests {
 		)
 
 		;; copy contents of the scratch buffer into the contract's memory.
-		(call $ext_scratch_copy
+		(call $ext_scratch_read
 			(i32.const 8)		;; Pointer in memory to the place where to copy.
 			(i32.const 0)		;; Offset from the start of the scratch buffer.
 			(i32.const 8)		;; Count of bytes to copy.
@@ -718,22 +799,19 @@ mod tests {
 
 	#[test]
 	fn address() {
-		let mut mock_ext = MockExt::default();
-		execute(
+		let _ = execute(
 			CODE_ADDRESS,
-			&[],
-			&mut Vec::new(),
-			&mut mock_ext,
+			vec![],
+			MockExt::default(),
 			&mut GasMeter::with_limit(50_000, 1),
-		)
-		.unwrap();
+		).unwrap();
 	}
 
 	const CODE_BALANCE: &str = r#"
 (module
 	(import "env" "ext_balance" (func $ext_balance))
 	(import "env" "ext_scratch_size" (func $ext_scratch_size (result i32)))
-	(import "env" "ext_scratch_copy" (func $ext_scratch_copy (param i32 i32 i32)))
+	(import "env" "ext_scratch_read" (func $ext_scratch_read (param i32 i32 i32)))
 	(import "env" "memory" (memory 1 1))
 
 	(func $assert (param i32)
@@ -758,7 +836,7 @@ mod tests {
 		)
 
 		;; copy contents of the scratch buffer into the contract's memory.
-		(call $ext_scratch_copy
+		(call $ext_scratch_read
 			(i32.const 8)		;; Pointer in memory to the place where to copy.
 			(i32.const 0)		;; Offset from the start of the scratch buffer.
 			(i32.const 8)		;; Count of bytes to copy.
@@ -780,23 +858,20 @@ mod tests {
 
 	#[test]
 	fn balance() {
-		let mut mock_ext = MockExt::default();
 		let mut gas_meter = GasMeter::with_limit(50_000, 1);
-		execute(
+		let _ = execute(
 			CODE_BALANCE,
-			&[],
-			&mut Vec::new(),
-			&mut mock_ext,
+			vec![],
+			MockExt::default(),
 			&mut gas_meter,
-		)
-		.unwrap();
+		).unwrap();
 	}
 
 	const CODE_GAS_PRICE: &str = r#"
 (module
 	(import "env" "ext_gas_price" (func $ext_gas_price))
 	(import "env" "ext_scratch_size" (func $ext_scratch_size (result i32)))
-	(import "env" "ext_scratch_copy" (func $ext_scratch_copy (param i32 i32 i32)))
+	(import "env" "ext_scratch_read" (func $ext_scratch_read (param i32 i32 i32)))
 	(import "env" "memory" (memory 1 1))
 
 	(func $assert (param i32)
@@ -821,7 +896,7 @@ mod tests {
 		)
 
 		;; copy contents of the scratch buffer into the contract's memory.
-		(call $ext_scratch_copy
+		(call $ext_scratch_read
 			(i32.const 8)		;; Pointer in memory to the place where to copy.
 			(i32.const 0)		;; Offset from the start of the scratch buffer.
 			(i32.const 8)		;; Count of bytes to copy.
@@ -843,23 +918,20 @@ mod tests {
 
 	#[test]
 	fn gas_price() {
-		let mut mock_ext = MockExt::default();
 		let mut gas_meter = GasMeter::with_limit(50_000, 1312);
-		execute(
+		let _ = execute(
 			CODE_GAS_PRICE,
-			&[],
-			&mut Vec::new(),
-			&mut mock_ext,
+			vec![],
+			MockExt::default(),
 			&mut gas_meter,
-		)
-		.unwrap();
+		).unwrap();
 	}
 
 	const CODE_GAS_LEFT: &str = r#"
 (module
 	(import "env" "ext_gas_left" (func $ext_gas_left))
 	(import "env" "ext_scratch_size" (func $ext_scratch_size (result i32)))
-	(import "env" "ext_scratch_copy" (func $ext_scratch_copy (param i32 i32 i32)))
+	(import "env" "ext_scratch_read" (func $ext_scratch_read (param i32 i32 i32)))
 	(import "env" "ext_return" (func $ext_return (param i32 i32)))
 	(import "env" "memory" (memory 1 1))
 
@@ -885,7 +957,7 @@ mod tests {
 		)
 
 		;; copy contents of the scratch buffer into the contract's memory.
-		(call $ext_scratch_copy
+		(call $ext_scratch_read
 			(i32.const 8)		;; Pointer in memory to the place where to copy.
 			(i32.const 0)		;; Offset from the start of the scratch buffer.
 			(i32.const 8)		;; Count of bytes to copy.
@@ -904,20 +976,16 @@ mod tests {
 
 	#[test]
 	fn gas_left() {
-		let mut mock_ext = MockExt::default();
 		let mut gas_meter = GasMeter::with_limit(50_000, 1312);
 
-		let mut return_buf = Vec::new();
-		execute(
+		let output = execute(
 			CODE_GAS_LEFT,
-			&[],
-			&mut return_buf,
-			&mut mock_ext,
+			vec![],
+			MockExt::default(),
 			&mut gas_meter,
-		)
-		.unwrap();
+		).unwrap();
 
-		let gas_left = Gas::decode(&mut &return_buf[..]).unwrap();
+		let gas_left = Gas::decode(&mut output.data.as_slice()).unwrap();
 		assert!(gas_left < 50_000, "gas_left must be less than initial");
 		assert!(gas_left > gas_meter.gas_left(), "gas_left must be greater than final");
 	}
@@ -926,7 +994,7 @@ mod tests {
 (module
 	(import "env" "ext_value_transferred" (func $ext_value_transferred))
 	(import "env" "ext_scratch_size" (func $ext_scratch_size (result i32)))
-	(import "env" "ext_scratch_copy" (func $ext_scratch_copy (param i32 i32 i32)))
+	(import "env" "ext_scratch_read" (func $ext_scratch_read (param i32 i32 i32)))
 	(import "env" "memory" (memory 1 1))
 
 	(func $assert (param i32)
@@ -951,7 +1019,7 @@ mod tests {
 		)
 
 		;; copy contents of the scratch buffer into the contract's memory.
-		(call $ext_scratch_copy
+		(call $ext_scratch_read
 			(i32.const 8)		;; Pointer in memory to the place where to copy.
 			(i32.const 0)		;; Offset from the start of the scratch buffer.
 			(i32.const 8)		;; Count of bytes to copy.
@@ -973,16 +1041,13 @@ mod tests {
 
 	#[test]
 	fn value_transferred() {
-		let mut mock_ext = MockExt::default();
 		let mut gas_meter = GasMeter::with_limit(50_000, 1);
-		execute(
+		let _ = execute(
 			CODE_VALUE_TRANSFERRED,
-			&[],
-			&mut Vec::new(),
-			&mut mock_ext,
+			vec![],
+			MockExt::default(),
 			&mut gas_meter,
-		)
-		.unwrap();
+		).unwrap();
 	}
 
 	const CODE_DISPATCH_CALL: &str = r#"
@@ -1008,14 +1073,12 @@ mod tests {
 		// let's rewrite so as we use this module controlled call or we serialize it in runtime.
 
 		let mut mock_ext = MockExt::default();
-		execute(
+		let _ = execute(
 			CODE_DISPATCH_CALL,
-			&[],
-			&mut Vec::new(),
+			vec![],
 			&mut mock_ext,
 			&mut GasMeter::with_limit(50_000, 1),
-		)
-		.unwrap();
+		).unwrap();
 
 		assert_eq!(
 			&mock_ext.dispatches,
@@ -1050,25 +1113,21 @@ mod tests {
 
 	#[test]
 	fn return_from_start_fn() {
-		let mut mock_ext = MockExt::default();
-		let mut output_data = Vec::new();
-		execute(
+		let output = execute(
 			CODE_RETURN_FROM_START_FN,
-			&[],
-			&mut output_data,
-			&mut mock_ext,
+			vec![],
+			MockExt::default(),
 			&mut GasMeter::with_limit(50_000, 1),
-		)
-		.unwrap();
+		).unwrap();
 
-		assert_eq!(output_data, vec![1, 2, 3, 4]);
+		assert_eq!(output, ExecReturnValue { status: STATUS_SUCCESS, data: vec![1, 2, 3, 4] });
 	}
 
 	const CODE_TIMESTAMP_NOW: &str = r#"
 (module
 	(import "env" "ext_now" (func $ext_now))
 	(import "env" "ext_scratch_size" (func $ext_scratch_size (result i32)))
-	(import "env" "ext_scratch_copy" (func $ext_scratch_copy (param i32 i32 i32)))
+	(import "env" "ext_scratch_read" (func $ext_scratch_read (param i32 i32 i32)))
 	(import "env" "memory" (memory 1 1))
 
 	(func $assert (param i32)
@@ -1093,7 +1152,7 @@ mod tests {
 		)
 
 		;; copy contents of the scratch buffer into the contract's memory.
-		(call $ext_scratch_copy
+		(call $ext_scratch_read
 			(i32.const 8)		;; Pointer in memory to the place where to copy.
 			(i32.const 0)		;; Offset from the start of the scratch buffer.
 			(i32.const 8)		;; Count of bytes to copy.
@@ -1115,23 +1174,79 @@ mod tests {
 
 	#[test]
 	fn now() {
-		let mut mock_ext = MockExt::default();
 		let mut gas_meter = GasMeter::with_limit(50_000, 1);
-		execute(
+		let _ = execute(
 			CODE_TIMESTAMP_NOW,
-			&[],
-			&mut Vec::new(),
-			&mut mock_ext,
+			vec![],
+			MockExt::default(),
 			&mut gas_meter,
+		).unwrap();
+	}
+
+	const CODE_MINIMUM_BALANCE: &str = r#"
+(module
+	(import "env" "ext_minimum_balance" (func $ext_minimum_balance))
+	(import "env" "ext_scratch_size" (func $ext_scratch_size (result i32)))
+	(import "env" "ext_scratch_read" (func $ext_scratch_read (param i32 i32 i32)))
+	(import "env" "memory" (memory 1 1))
+
+	(func $assert (param i32)
+		(block $ok
+			(br_if $ok
+				(get_local 0)
+			)
+			(unreachable)
 		)
-		.unwrap();
+	)
+
+	(func (export "call")
+		(call $ext_minimum_balance)
+
+		;; assert $ext_scratch_size == 8
+		(call $assert
+			(i32.eq
+				(call $ext_scratch_size)
+				(i32.const 8)
+			)
+		)
+
+		;; copy contents of the scratch buffer into the contract's memory.
+		(call $ext_scratch_read
+			(i32.const 8)		;; Pointer in memory to the place where to copy.
+			(i32.const 0)		;; Offset from the start of the scratch buffer.
+			(i32.const 8)		;; Count of bytes to copy.
+		)
+
+		;; assert that contents of the buffer is equal to the i64 value of 666.
+		(call $assert
+			(i64.eq
+				(i64.load
+					(i32.const 8)
+				)
+				(i64.const 666)
+			)
+		)
+	)
+	(func (export "deploy"))
+)
+"#;
+
+	#[test]
+	fn minimum_balance() {
+		let mut gas_meter = GasMeter::with_limit(50_000, 1);
+		let _ = execute(
+			CODE_MINIMUM_BALANCE,
+			vec![],
+			MockExt::default(),
+			&mut gas_meter,
+		).unwrap();
 	}
 
 	const CODE_RANDOM: &str = r#"
 (module
 	(import "env" "ext_random" (func $ext_random (param i32 i32)))
 	(import "env" "ext_scratch_size" (func $ext_scratch_size (result i32)))
-	(import "env" "ext_scratch_copy" (func $ext_scratch_copy (param i32 i32 i32)))
+	(import "env" "ext_scratch_read" (func $ext_scratch_read (param i32 i32 i32)))
 	(import "env" "ext_return" (func $ext_return (param i32 i32)))
 	(import "env" "memory" (memory 1 1))
 
@@ -1160,7 +1275,7 @@ mod tests {
 		)
 
 		;; copy contents of the scratch buffer into the contract's memory.
-		(call $ext_scratch_copy
+		(call $ext_scratch_read
 			(i32.const 8)		;; Pointer in memory to the place where to copy.
 			(i32.const 0)		;; Offset from the start of the scratch buffer.
 			(i32.const 32)		;; Count of bytes to copy.
@@ -1186,23 +1301,22 @@ mod tests {
 
 	#[test]
 	fn random() {
-		let mut mock_ext = MockExt::default();
 		let mut gas_meter = GasMeter::with_limit(50_000, 1);
 
-		let mut return_buf = Vec::new();
-		execute(
+		let output = execute(
 			CODE_RANDOM,
-			&[],
-			&mut return_buf,
-			&mut mock_ext,
+			vec![],
+			MockExt::default(),
 			&mut gas_meter,
-		)
-		.unwrap();
+		).unwrap();
 
 		// The mock ext just returns the same data that was passed as the subject.
 		assert_eq!(
-			&return_buf,
-			&hex!("000102030405060708090A0B0C0D0E0F000102030405060708090A0B0C0D0E0F")
+			output,
+			ExecReturnValue {
+				status: STATUS_SUCCESS,
+				data: hex!("000102030405060708090A0B0C0D0E0F000102030405060708090A0B0C0D0E0F").to_vec(),
+			},
 		);
 	}
 
@@ -1233,14 +1347,12 @@ mod tests {
 	fn deposit_event() {
 		let mut mock_ext = MockExt::default();
 		let mut gas_meter = GasMeter::with_limit(50_000, 1);
-		execute(
+		let _ = execute(
 			CODE_DEPOSIT_EVENT,
-			&[],
-			&mut Vec::new(),
+			vec![],
 			&mut mock_ext,
 			&mut gas_meter
-		)
-		.unwrap();
+		).unwrap();
 
 		assert_eq!(mock_ext.events, vec![
 			(vec![H256::repeat_byte(0x33)],
@@ -1284,18 +1396,16 @@ mod tests {
 	#[test]
 	fn deposit_event_max_topics() {
 		// Checks that the runtime traps if there are more than `max_topic_events` topics.
-		let mut mock_ext = MockExt::default();
 		let mut gas_meter = GasMeter::with_limit(50_000, 1);
 
-		assert_eq!(
+		assert_matches!(
 			execute(
 				CODE_DEPOSIT_EVENT_MAX_TOPICS,
-				&[],
-				&mut Vec::new(),
-				&mut mock_ext,
+				vec![],
+				MockExt::default(),
 				&mut gas_meter
 			),
-			Err("during execution"),
+			Err(ExecError { reason: "during execution", buffer: _ })
 		);
 	}
 
@@ -1328,18 +1438,204 @@ mod tests {
 	#[test]
 	fn deposit_event_duplicates() {
 		// Checks that the runtime traps if there are duplicates.
-		let mut mock_ext = MockExt::default();
 		let mut gas_meter = GasMeter::with_limit(50_000, 1);
 
-		assert_eq!(
+		assert_matches!(
 			execute(
 				CODE_DEPOSIT_EVENT_DUPLICATES,
-				&[],
-				&mut Vec::new(),
-				&mut mock_ext,
+				vec![],
+				MockExt::default(),
 				&mut gas_meter
 			),
-			Err("during execution"),
+			Err(ExecError { reason: "during execution", buffer: _ })
 		);
+	}
+
+	/// calls `ext_block_number`, loads the current block number from the scratch buffer and
+	/// compares it with the constant 121.
+	const CODE_BLOCK_NUMBER: &str = r#"
+(module
+	(import "env" "ext_block_number" (func $ext_block_number))
+	(import "env" "ext_scratch_size" (func $ext_scratch_size (result i32)))
+	(import "env" "ext_scratch_read" (func $ext_scratch_read (param i32 i32 i32)))
+	(import "env" "memory" (memory 1 1))
+
+	(func $assert (param i32)
+		(block $ok
+			(br_if $ok
+				(get_local 0)
+			)
+			(unreachable)
+		)
+	)
+
+	(func (export "call")
+		;; This stores the block height in the scratch buffer
+		(call $ext_block_number)
+
+		;; assert $ext_scratch_size == 8
+		(call $assert
+			(i32.eq
+				(call $ext_scratch_size)
+				(i32.const 8)
+			)
+		)
+
+		;; copy contents of the scratch buffer into the contract's memory.
+		(call $ext_scratch_read
+			(i32.const 8)		;; Pointer in memory to the place where to copy.
+			(i32.const 0)		;; Offset from the start of the scratch buffer.
+			(i32.const 8)		;; Count of bytes to copy.
+		)
+
+		;; assert that contents of the buffer is equal to the i64 value of 121.
+		(call $assert
+			(i64.eq
+				(i64.load
+					(i32.const 8)
+				)
+				(i64.const 121)
+			)
+		)
+	)
+
+	(func (export "deploy"))
+)
+"#;
+
+	#[test]
+	fn block_number() {
+		let _ = execute(
+			CODE_BLOCK_NUMBER,
+			vec![],
+			MockExt::default(),
+			&mut GasMeter::with_limit(50_000, 1),
+		).unwrap();
+	}
+
+	// asserts that the size of the input data is 4.
+	const CODE_SIMPLE_ASSERT: &str = r#"
+(module
+	(import "env" "ext_scratch_size" (func $ext_scratch_size (result i32)))
+
+	(func $assert (param i32)
+		(block $ok
+			(br_if $ok
+				(get_local 0)
+			)
+			(unreachable)
+		)
+	)
+
+	(func (export "deploy"))
+
+	(func (export "call")
+		(call $assert
+			(i32.eq
+				(call $ext_scratch_size)
+				(i32.const 4)
+			)
+		)
+	)
+)
+"#;
+
+	#[test]
+	fn output_buffer_capacity_preserved_on_success() {
+		let mut input_data = Vec::with_capacity(1_234);
+		input_data.extend_from_slice(&[1, 2, 3, 4][..]);
+
+		let output = execute(
+			CODE_SIMPLE_ASSERT,
+			input_data,
+			MockExt::default(),
+			&mut GasMeter::with_limit(50_000, 1),
+		).unwrap();
+
+		assert_eq!(output.data.len(), 0);
+		assert_eq!(output.data.capacity(), 1_234);
+	}
+
+	#[test]
+	fn output_buffer_capacity_preserved_on_failure() {
+		let mut input_data = Vec::with_capacity(1_234);
+		input_data.extend_from_slice(&[1, 2, 3, 4, 5][..]);
+
+		let error = execute(
+			CODE_SIMPLE_ASSERT,
+			input_data,
+			MockExt::default(),
+			&mut GasMeter::with_limit(50_000, 1),
+		).err().unwrap();
+
+		assert_eq!(error.buffer.capacity(), 1_234);
+	}
+
+	const CODE_RETURN_WITH_DATA: &str = r#"
+(module
+	(import "env" "ext_scratch_size" (func $ext_scratch_size (result i32)))
+	(import "env" "ext_scratch_read" (func $ext_scratch_read (param i32 i32 i32)))
+	(import "env" "ext_scratch_write" (func $ext_scratch_write (param i32 i32)))
+	(import "env" "memory" (memory 1 1))
+
+	;; Deploy routine is the same as call.
+	(func (export "deploy") (result i32)
+		(call $call)
+	)
+
+	;; Call reads the first 4 bytes (LE) as the exit status and returns the rest as output data.
+	(func $call (export "call") (result i32)
+		(local $buf_size i32)
+		(local $exit_status i32)
+
+		;; Find out the size of the scratch buffer
+		(set_local $buf_size (call $ext_scratch_size))
+
+		;; Copy scratch buffer into this contract memory.
+		(call $ext_scratch_read
+			(i32.const 0)		;; The pointer where to store the scratch buffer contents,
+			(i32.const 0)		;; Offset from the start of the scratch buffer.
+			(get_local $buf_size)		;; Count of bytes to copy.
+		)
+
+		;; Copy all but the first 4 bytes of the input data as the output data.
+		(call $ext_scratch_write
+			(i32.const 4)		;; Offset from the start of the scratch buffer.
+			(i32.sub		;; Count of bytes to copy.
+				(get_local $buf_size)
+				(i32.const 4)
+			)
+		)
+
+		;; Return the first 4 bytes of the input data as the exit status.
+		(i32.load (i32.const 0))
+	)
+)
+"#;
+
+	#[test]
+	fn return_with_success_status() {
+		let output = execute(
+			CODE_RETURN_WITH_DATA,
+			hex!("00112233445566778899").to_vec(),
+			MockExt::default(),
+			&mut GasMeter::with_limit(50_000, 1),
+		).unwrap();
+
+		assert_eq!(output, ExecReturnValue { status: 0, data: hex!("445566778899").to_vec() });
+		assert!(output.is_success());
+	}
+
+	#[test]
+	fn return_with_failure_status() {
+		let output = execute(
+			CODE_RETURN_WITH_DATA,
+			hex!("112233445566778899").to_vec(),
+			MockExt::default(),
+			&mut GasMeter::with_limit(50_000, 1),
+		).unwrap();
+
+		assert_eq!(output, ExecReturnValue { status: 17, data: hex!("5566778899").to_vec() });
+		assert!(!output.is_success());
 	}
 }

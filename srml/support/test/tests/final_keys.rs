@@ -15,21 +15,21 @@
 // along with Substrate.  If not, see <http://www.gnu.org/licenses/>.
 
 use runtime_io::{with_externalities, Blake2Hasher};
-use srml_support::{StorageValue, StorageMap, StorageDoubleMap};
-use srml_support::storage::unhashed;
-use parity_codec::{Encode, Decode};
+use support::{StorageValue, StorageMap, StorageLinkedMap, StorageDoubleMap};
+use support::storage::unhashed;
+use codec::{Encode, Decode};
 
 pub trait Trait {
 	type Origin;
 	type BlockNumber: Encode + Decode + Default + Clone;
 }
 
-srml_support::decl_module! {
+support::decl_module! {
 	pub struct Module<T: Trait> for enum Call where origin: T::Origin {}
 }
 
-srml_support::decl_storage!{
-	trait Store for Module<T: Trait> as Module {
+support::decl_storage!{
+	trait Store for Module<T: Trait> as FinalKeys {
 		pub Value config(value): u32;
 
 		pub Map: map u32 => u32;
@@ -53,44 +53,44 @@ impl Trait for Test {
 }
 
 fn new_test_ext() -> runtime_io::TestExternalities<Blake2Hasher> {
-	GenesisConfig::<Test>::default().build_storage().unwrap().0.into()
+	GenesisConfig::<Test>::default().build_storage().unwrap().into()
 }
 
 #[test]
 fn final_keys() {
 	with_externalities(&mut new_test_ext(), || {
 		Value::put(1);
-		assert_eq!(unhashed::get::<u32>(&runtime_io::twox_128(b"Module Value")), Some(1u32));
+		assert_eq!(unhashed::get::<u32>(&runtime_io::twox_128(b"FinalKeys Value")), Some(1u32));
 
 		Map::insert(1, 2);
-		let mut k = b"Module Map".to_vec();
+		let mut k = b"FinalKeys Map".to_vec();
 		k.extend(1u32.encode());
 		assert_eq!(unhashed::get::<u32>(&runtime_io::blake2_256(&k)), Some(2u32));
 
 		Map2::insert(1, 2);
-		let mut k = b"Module Map2".to_vec();
+		let mut k = b"FinalKeys Map2".to_vec();
 		k.extend(1u32.encode());
 		assert_eq!(unhashed::get::<u32>(&runtime_io::twox_128(&k)), Some(2u32));
 
 		LinkedMap::insert(1, 2);
-		let mut k = b"Module LinkedMap".to_vec();
+		let mut k = b"FinalKeys LinkedMap".to_vec();
 		k.extend(1u32.encode());
 		assert_eq!(unhashed::get::<u32>(&runtime_io::blake2_256(&k)), Some(2u32));
 
 		LinkedMap2::insert(1, 2);
-		let mut k = b"Module LinkedMap2".to_vec();
+		let mut k = b"FinalKeys LinkedMap2".to_vec();
 		k.extend(1u32.encode());
 		assert_eq!(unhashed::get::<u32>(&runtime_io::twox_128(&k)), Some(2u32));
 
-		DoubleMap::insert(1, 2, 3);
-		let mut k = b"Module DoubleMap".to_vec();
+		DoubleMap::insert(&1, &2, &3);
+		let mut k = b"FinalKeys DoubleMap".to_vec();
 		k.extend(1u32.encode());
 		let mut k = runtime_io::blake2_256(&k).to_vec();
 		k.extend(&runtime_io::blake2_256(&2u32.encode()));
 		assert_eq!(unhashed::get::<u32>(&k), Some(3u32));
 
-		DoubleMap2::insert(1, 2, 3);
-		let mut k = b"Module DoubleMap2".to_vec();
+		DoubleMap2::insert(&1, &2, &3);
+		let mut k = b"FinalKeys DoubleMap2".to_vec();
 		k.extend(1u32.encode());
 		let mut k = runtime_io::twox_128(&k).to_vec();
 		k.extend(&runtime_io::blake2_128(&2u32.encode()));
